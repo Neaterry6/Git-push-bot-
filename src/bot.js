@@ -8,8 +8,8 @@ const { PassThrough } = require('stream');
 require('dotenv').config();
 
 const callClaudePro = require('./utils/claudePro');
-const exec = require('./utils/executor');
 const workspace = require('./utils/workspace');
+const terminal = require('./utils/terminal');
 const gitPushScene = require('./scenes/gitPush');
 
 if (!process.env.BOT_TOKEN) {
@@ -58,9 +58,9 @@ bot.on('text', async (ctx) => {
 async function runTerminalCommand(ctx, command, cwd) {
   await ctx.reply(`🔄 Running: \`${command}\``);
   try {
-    const result = await exec(command, { cwd });
-    const output = result.stdout || result.stderr || 'Done';
+    const { output, cwd: activeCwd } = await terminal.run(ctx.from.id, command, cwd);
     await ctx.reply(`✅ Output:\n\n\`\`\`\n${output.slice(0, 3500)}\n\`\`\``);
+    await ctx.reply(`📁 CWD: ${activeCwd}`);
   } catch (error) {
     await ctx.reply(`❌ ${error.message}`);
   }
