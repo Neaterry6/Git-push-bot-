@@ -36,6 +36,7 @@ const gitPushScene = new Scenes.WizardScene(
       await exec('git init', { cwd });
       await exec('git config user.name "TelegramBot"', { cwd });
       await exec('git config user.email "bot@telegram.com"', { cwd });
+      await exec('git checkout -B main', { cwd });
       await exec('git add .', { cwd });
 
       try {
@@ -46,14 +47,31 @@ const gitPushScene = new Scenes.WizardScene(
         }
       }
 
-      const pushUrl = repoUrl.replace('https://', `https://${token}@`);
-      const branchOut = await exec('git branch --show-current', { cwd });
-      const branch = branchOut.stdout.trim() || 'main';
-      await exec(`git push -u ${pushUrl} ${branch} --force-with-lease`, { cwd });
+      const pushUrl = repoUrl.replace('https://', `https://x-access-token:${token}@`);
+
+      try {
+        await exec(`git remote add origin ${pushUrl}`, { cwd });
+      } catch (_error) {
+        await exec(`git remote set-url origin ${pushUrl}`, { cwd });
+      }
+
+      try {
+        await exec('git fetch origin main', { cwd });
+      } catch (_error) {
+        // Remote may be empty; continue.
+      }
+
+      try {
+        await exec('git pull --rebase origin main', { cwd });
+      } catch (_error) {
+        // If histories are unrelated/new repo, pushing a fresh branch still works.
+      }
+
+      await exec('git push -u origin main', { cwd });
 
       await ctx.reply(`✅ Push Successful!\n\nRepo: ${repoUrl.replace('.git', '')}`);
     } catch (error) {
-      await ctx.reply(`❌ Push failed:\n${error.message}\n\nTry: git pull --rebase or check token scopes.`);
+      await ctx.reply(`❌ Push failed:\n${error.message}\n\nChecks:\n1) PAT has repo scope\n2) Repo URL is correct\n3) Default branch permission allows push`);
     }
 
     return ctx.scene.leave();
