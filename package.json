@@ -1,14 +1,17 @@
 {
-  "name": "telegram-shell-bot",
+  "name": "smart-terminal-bot",
   "version": "1.0.0",
-  "description": "Telegram bot with shell emulator, zip manager, GitHub integration, admin control, and Gemini AI chat",
-  "main": "src/bot.js",
+  "description": "Smart memory-enabled Telegram terminal and coding assistant bot",
+  "main": "bot.js",
   "scripts": {
-    "start": "node src/bot.js"
+    "start": "node bot.js"
   },
   "dependencies": {
+    "adm-zip": "^0.5.16",
+    "archiver": "^7.0.1",
     "axios": "^1.6.7",
     "dotenv": "^16.4.0",
-    "node-telegram-bot-api": "^0.61.0"
+    "fs-extra": "^11.3.2",
+    "telegraf": "^4.16.3"
   }
 }
