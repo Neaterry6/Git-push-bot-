@@ -5,30 +5,33 @@ const path = require('path');
 const archiver = require('archiver');
 const { PassThrough } = require('stream');
 
+require('dotenv').config();
+
 const callClaudePro = require('./utils/claudePro');
 const exec = require('./utils/executor');
 const workspace = require('./utils/workspace');
 const gitPushScene = require('./scenes/gitPush');
 
-require('dotenv').config();
+if (!process.env.BOT_TOKEN) {
+  throw new Error('Missing BOT_TOKEN in environment.');
+}
 
 const bot = new Telegraf(process.env.BOT_TOKEN);
 const stage = new Scenes.Stage([gitPushScene]);
+
 bot.use(session());
 bot.use(stage.middleware());
 
 bot.start(async (ctx) => {
-  const userId = ctx.from.id;
-  await workspace.create(userId);
-  await ctx.reply('✅ Smart Workspace Ready!\n\nJust talk naturally. I remember everything.');
+  await workspace.create(ctx.from.id);
+  await ctx.reply('✅ Bot connected successfully.\nWorkspace ready.\nTalk naturally — I remember everything.');
 });
 
 bot.on('text', async (ctx) => {
-  const userText = (ctx.message.text || '').trim();
-  const userId = ctx.from.id;
-
+  const userText = (ctx.message?.text || '').trim();
   if (userText.length < 2) return;
 
+  const userId = ctx.from.id;
   await workspace.create(userId);
   const cwd = workspace.getPath(userId);
 
@@ -38,30 +41,18 @@ bot.on('text', async (ctx) => {
 
   let intent = { intent: 'chat' };
   const intentText = await callClaudePro(userId, intentPrompt);
-
   try {
     intent = JSON.parse(intentText);
   } catch (_error) {
     intent = { intent: 'chat' };
   }
 
-  if (intent.intent === 'build_app') {
-    await handleLlamaCoder(ctx, intent.app_prompt || userText, cwd);
-    return;
-  }
-
-  if (intent.intent === 'git_push') {
-    await ctx.scene.enter('gitPush');
-    return;
-  }
-
-  if (intent.intent === 'terminal' && intent.command) {
-    await runTerminalCommand(ctx, intent.command, cwd);
-    return;
-  }
+  if (intent.intent === 'build_app') return handleLlamaCoder(ctx, intent.app_prompt || userText, cwd);
+  if (intent.intent === 'git_push') return ctx.scene.enter('gitPush');
+  if (intent.intent === 'terminal' && intent.command) return runTerminalCommand(ctx, intent.command, cwd);
 
   const response = await callClaudePro(userId, userText);
-  await ctx.reply(response);
+  return ctx.reply(response);
 });
 
 async function runTerminalCommand(ctx, command, cwd) {
@@ -77,7 +68,6 @@ async function runTerminalCommand(ctx, command, cwd) {
 
 async function handleLlamaCoder(ctx, prompt, cwd) {
   await ctx.reply('🦙 Building full app with LlamaCoder...');
-
   try {
     const { data } = await axios.get(
       `https://omegatech-api.dixonomega.tech/api/ai/llamacoder?action=create&prompt=${encodeURIComponent(prompt)}&quality=low`,
@@ -85,8 +75,7 @@ async function handleLlamaCoder(ctx, prompt, cwd) {
     );
 
     if (!data?.success || !Array.isArray(data.files) || data.files.length === 0) {
-      await ctx.reply(data?.rawOutput || 'No files generated.');
-      return;
+      return ctx.reply(data?.rawOutput || 'No files generated.');
     }
 
     for (const file of data.files) {
@@ -96,14 +85,12 @@ async function handleLlamaCoder(ctx, prompt, cwd) {
     }
 
     await ctx.reply(`✅ App saved to workspace! ${data.files.length} files created.`);
-
     const zipBuffer = await createZipFromFiles(data.files);
-    await ctx.replyWithDocument({
-      source: zipBuffer,
-      filename: `app-${Date.now()}.zip`
-    });
+
+    await ctx.replyWithDocument({ source: zipBuffer, filename: `app-${Date.now()}.zip` });
+    return null;
   } catch (error) {
-    await ctx.reply(`Build failed: ${error.message}`);
+    return ctx.reply(`Build failed: ${error.message}`);
   }
 }
 
@@ -128,5 +115,11 @@ function createZipFromFiles(files) {
   });
 }
 
-bot.launch();
-console.log('Smart terminal bot is running...');
+console.log('Connecting to Telegram...');
+bot
+  .launch()
+  .then(() => console.log(`🤖 Dirty Bot LIVE → Connected as @${bot.botInfo?.username || 'YourBot'}`))
+  .catch((error) => console.error('Launch failed:', error));
+
+process.once('SIGINT', () => bot.stop('SIGINT'));
+process.once('SIGTERM', () => bot.stop('SIGTERM'));

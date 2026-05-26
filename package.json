@@ -2,9 +2,9 @@
   "name": "smart-terminal-bot",
   "version": "1.0.0",
   "description": "Smart memory-enabled Telegram terminal and coding assistant bot",
-  "main": "src/bot.js",
+  "main": "bot.js",
   "scripts": {
-    "start": "node src/bot.js"
+    "start": "node bot.js"
   },
   "dependencies": {
     "adm-zip": "^0.5.16",
