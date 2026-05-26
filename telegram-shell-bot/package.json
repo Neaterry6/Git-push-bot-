@@ -1,0 +1,14 @@
+{
+  "name": "telegram-shell-bot",
+  "version": "1.0.0",
+  "description": "Telegram bot with shell emulator, zip manager, GitHub integration, admin control, and Gemini AI chat",
+  "main": "src/bot.js",
+  "scripts": {
+    "start": "node src/bot.js"
+  },
+  "dependencies": {
+    "axios": "^1.6.7",
+    "dotenv": "^16.4.0",
+    "node-telegram-bot-api": "^0.61.0"
+  }
+}
