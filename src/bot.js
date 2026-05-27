@@ -13,6 +13,7 @@ const terminal = require('./utils/terminal');
 const gitPushScene = require('./scenes/gitPush');
 const { buildHelpText } = require('./commands/help');
 const accessControl = require('./utils/accessControl');
+const { appendLog, tailLogs } = require('./utils/logs');
 
 if (!process.env.BOT_TOKEN) {
   throw new Error('Missing BOT_TOKEN in environment.');
@@ -43,6 +44,11 @@ bot.command('run', async (ctx) => {
   const command = (ctx.message?.text || '').replace(/^\/run\s*/, '').trim();
   if (!command) return ctx.reply('Usage: /run <command>');
   return runTerminalCommand(ctx, command, workspace.getPath(ctx.from.id));
+});
+
+bot.command('logs', async (ctx) => {
+  const output = await tailLogs(60);
+  return ctx.reply(`🧾 Bot logs (latest):\n\n\`\`\`\n${output.slice(0, 3500)}\n\`\`\``);
 });
 
 bot.command('workspace', async (ctx) => {
@@ -93,6 +99,7 @@ bot.on('text', async (ctx) => {
   const userId = ctx.from.id;
   const cwd = workspace.getPath(userId);
 
+  await appendLog(userId, 'chat_message', userText);
   await ctx.reply('🧠 Thinking with Claude Pro...');
 
   const intentPrompt = `Classify this user message into ONE category. Return ONLY valid JSON.\nUser: "${userText}"\n\nCategories:\n- chat → normal conversation\n- terminal → run shell/git command\n- build_app → create app with LlamaCoder\n- git_push → push code to GitHub\n\nResponse format:\n{"intent": "chat|terminal|build_app|git_push", "command": "...", "app_prompt": "..."}`;
@@ -114,12 +121,15 @@ bot.on('text', async (ctx) => {
 });
 
 async function runTerminalCommand(ctx, command, cwd) {
+  await appendLog(ctx.from.id, 'terminal_run', command);
   await ctx.reply(`🔄 Running: \`${command}\``);
   try {
     const { output, cwd: activeCwd } = await terminal.run(ctx.from.id, command, cwd);
+    await appendLog(ctx.from.id, 'terminal_output', output.slice(0, 300));
     await ctx.reply(`✅ Output:\n\n\`\`\`\n${output.slice(0, 3500)}\n\`\`\``);
     await ctx.reply(`📁 CWD: ${activeCwd}`);
   } catch (error) {
+    await appendLog(ctx.from.id, 'terminal_error', error.message);
     await ctx.reply(`❌ ${error.message}`);
   }
 }
