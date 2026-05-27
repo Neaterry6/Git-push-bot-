@@ -81,13 +81,22 @@ ${ls.stdout}
       await ctx.reply('3/8 Creating/switching to main branch...');
       await exec('git checkout -B main', { cwd: gitCwd });
       await ctx.reply('4/8 Staging files...');
-      await exec('git add .', { cwd: gitCwd });
+      await exec('git add -A', { cwd: gitCwd });
+      const statusOutput = await exec('git status --short', { cwd: gitCwd });
+      if (statusOutput.stdout.trim()) {
+        await ctx.reply(`🧾 Staged changes:\n\n\`\`\`\n${statusOutput.stdout}\n\`\`\``);
+      } else {
+        await ctx.reply('ℹ️ No file changes detected after staging. I will create an empty commit so push can continue.');
+      }
 
       await ctx.reply('5/8 Committing files...');
       try {
         await exec('git commit -m "Initial commit from Telegram Bot"', { cwd: gitCwd });
       } catch (error) {
-        if (!String(error.stderr || error.message).includes('nothing to commit')) {
+        const commitError = String(error.stderr || error.message);
+        if (commitError.includes('nothing to commit')) {
+          await exec('git commit --allow-empty -m "Initial commit from Telegram Bot"', { cwd: gitCwd });
+        } else {
           throw error;
         }
       }
