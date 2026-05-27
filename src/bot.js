@@ -11,6 +11,8 @@ const callClaudePro = require('./utils/claudePro');
 const workspace = require('./utils/workspace');
 const terminal = require('./utils/terminal');
 const gitPushScene = require('./scenes/gitPush');
+const { buildHelpText } = require('./commands/help');
+const accessControl = require('./utils/accessControl');
 
 if (!process.env.BOT_TOKEN) {
   throw new Error('Missing BOT_TOKEN in environment.');
@@ -22,17 +24,73 @@ const stage = new Scenes.Stage([gitPushScene]);
 bot.use(session());
 bot.use(stage.middleware());
 
-bot.start(async (ctx) => {
-  await workspace.create(ctx.from.id);
-  await ctx.reply('✅ Bot connected successfully.\nWorkspace ready.\nTalk naturally — I remember everything.');
+bot.use(async (ctx, next) => {
+  if (ctx.from?.id) {
+    await workspace.create(ctx.from.id);
+    await accessControl.registerUser(ctx.from);
+  }
+  return next();
 });
+
+bot.start(async (ctx) => {
+  await ctx.reply('✅ Bot connected successfully.\nWorkspace ready.\nUse /help for commands.');
+});
+
+bot.command('help', async (ctx) => ctx.reply(buildHelpText('/')));
+bot.command('gitpush', async (ctx) => ctx.scene.enter('gitPush'));
+
+bot.command('run', async (ctx) => {
+  const command = (ctx.message?.text || '').replace(/^\/run\s*/, '').trim();
+  if (!command) return ctx.reply('Usage: /run <command>');
+  return runTerminalCommand(ctx, command, workspace.getPath(ctx.from.id));
+});
+
+bot.command('workspace', async (ctx) => {
+  const { cwd, items } = await accessControl.getWorkspaceFiles(ctx.from.id);
+  return ctx.reply(`📁 ${cwd}\n\n${items.length ? items.join('\n') : '(empty workspace)'}`);
+});
+
+bot.command('getfile', async (ctx) => {
+  const rel = (ctx.message?.text || '').replace(/^\/getfile\s*/, '').trim();
+  if (!rel) return ctx.reply('Usage: /getfile <relative-path>');
+  const filePath = path.resolve(workspace.getPath(ctx.from.id), rel);
+  if (!filePath.startsWith(workspace.getPath(ctx.from.id))) return ctx.reply('Invalid path.');
+  if (!(await fs.pathExists(filePath))) return ctx.reply('File not found.');
+  return ctx.replyWithDocument({ source: filePath });
+});
+
+bot.command('users', async (ctx) => {
+  if (!(await accessControl.isAdmin(ctx.from.id))) return ctx.reply('Admin only command.');
+  const users = await accessControl.listUsers();
+  const lines = users.map((u) => `${u.id} | @${u.username || '-'} | banned=${u.banned} | pushes=${u.pushCount}/${accessControl.DAILY_LIMIT}`);
+  return ctx.reply(lines.length ? lines.join('\n') : 'No users yet.');
+});
+
+bot.command('ban', async (ctx) => adminUserAction(ctx, 'ban'));
+bot.command('unban', async (ctx) => adminUserAction(ctx, 'unban'));
+bot.command('resetuser', async (ctx) => adminUserAction(ctx, 'reset'));
+
+async function adminUserAction(ctx, action) {
+  if (!(await accessControl.isAdmin(ctx.from.id))) return ctx.reply('Admin only command.');
+  const target = (ctx.message?.text || '').split(/\s+/)[1];
+  if (!target || !/^\d+$/.test(target)) return ctx.reply('Provide a numeric user id.');
+  if (action === 'ban') {
+    await accessControl.setBan(target, true);
+    return ctx.reply(`User ${target} banned.`);
+  }
+  if (action === 'unban') {
+    await accessControl.setBan(target, false);
+    return ctx.reply(`User ${target} unbanned.`);
+  }
+  await accessControl.resetUser(target);
+  return ctx.reply(`User ${target} reset.`);
+}
 
 bot.on('text', async (ctx) => {
   const userText = (ctx.message?.text || '').trim();
-  if (userText.length < 2) return;
+  if (userText.length < 2 || userText.startsWith('/')) return;
 
   const userId = ctx.from.id;
-  await workspace.create(userId);
   const cwd = workspace.getPath(userId);
 
   await ctx.reply('🧠 Thinking with Claude Pro...');
