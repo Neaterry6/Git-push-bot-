@@ -90,16 +90,7 @@ ${ls.stdout}
       }
 
       await ctx.reply('5/8 Committing files...');
-      try {
-        await exec('git commit -m "Initial commit from Telegram Bot"', { cwd: gitCwd });
-      } catch (error) {
-        const commitError = String(error.stderr || error.message);
-        if (commitError.includes('nothing to commit')) {
-          await exec('git commit --allow-empty -m "Initial commit from Telegram Bot"', { cwd: gitCwd });
-        } else {
-          throw error;
-        }
-      }
+      await exec('git commit --allow-empty -m "Initial commit from Telegram Bot"', { cwd: gitCwd });
 
       const pushUrl = repoUrl.replace('https://', `https://x-access-token:${token}@`);
 
