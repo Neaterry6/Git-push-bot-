@@ -15,10 +15,10 @@ npm install
 npm start
 ```
 
-`npm start` runs:
+`npm start` runs the root launcher:
 
 ```bash
-node src/bot.js
+node bot.js
 ```
 
 You can also run via the new root entrypoint:
@@ -26,6 +26,15 @@ You can also run via the new root entrypoint:
 ```bash
 node index.js
 ```
+
+## Commands
+
+- `/help` - show bot help.
+- `/gitpush` - push the current workspace or latest uploaded zip to GitHub `main`. The bot now refuses empty commits and reports ignored/untracked files before pushing.
+- `/run <command>` - run a shell command in your workspace.
+- `/play <song name>` - search and play a song using the configured play API.
+- `/workspace` - list files in your workspace.
+- `/getfile <relative-path>` - download a workspace file.
 
 ## Environment variables
 
