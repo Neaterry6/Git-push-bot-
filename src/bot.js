@@ -14,6 +14,7 @@ const gitPushScene = require('./scenes/gitPush');
 const { buildHelpText } = require('./commands/help');
 const accessControl = require('./utils/accessControl');
 const { appendLog, tailLogs } = require('./utils/logs');
+const { isZipFileName, listWorkspaceZips, saveTelegramZip } = require('./utils/fileHandler');
 
 if (!process.env.BOT_TOKEN) {
   throw new Error('Missing BOT_TOKEN in environment.');
@@ -105,6 +106,37 @@ bot.command('getfile', async (ctx) => {
   if (!filePath.startsWith(workspace.getPath(ctx.from.id))) return ctx.reply('Invalid path.');
   if (!(await fs.pathExists(filePath))) return ctx.reply('File not found.');
   return ctx.replyWithDocument({ source: filePath });
+});
+
+
+bot.on('document', async (ctx) => {
+  const document = ctx.message?.document;
+  const fileName = document?.file_name || '';
+
+  if (!isZipFileName(fileName)) return ctx.reply('I can save .zip uploads only. Send a .zip file, then use /gitpush or reply to the zip with /gitpush.');
+
+  const userId = ctx.from.id;
+  const cwd = workspace.getPath(userId);
+
+  try {
+    const savedZip = await saveTelegramZip(ctx, cwd, document);
+    await appendLog(userId, 'zip_saved', savedZip.name);
+    const zipListing = await listWorkspaceZips(cwd);
+
+    await ctx.reply(`✅ Saved zip: ${savedZip.name}
+
+📦 Workspace zip files (ls):
+
+\`\`\`
+${zipListing.slice(0, 3200)}
+\`\`\`
+
+I will extract it now, then ask for the GitHub repo URL before asking for your token.`);
+    return ctx.scene.enter('gitPush', { zipAlreadySaved: true });
+  } catch (error) {
+    await appendLog(userId, 'zip_save_failed', error.message);
+    return ctx.reply(`❌ Failed to save zip: ${error.message}`);
+  }
 });
 
 bot.command('users', async (ctx) => {
