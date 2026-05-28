@@ -3,7 +3,7 @@ const path = require('path');
 const fs = require('fs-extra');
 const exec = require('../utils/executor');
 const workspace = require('../utils/workspace');
-const { findLatestZip, unzipFile } = require('../utils/fileHandler');
+const { findLatestZip, getZipDocumentFromContext, listWorkspaceZips, saveTelegramZip, unzipFile } = require('../utils/fileHandler');
 const accessControl = require('../utils/accessControl');
 const { appendLog } = require('../utils/logs');
 
@@ -78,8 +78,23 @@ async function getIgnoredFiles(cwd) {
 }
 
 async function prepareGitDirectory(ctx, userId, cwd) {
-  await ctx.reply('🔍 Checking workspace for zip before push...');
+  await ctx.reply('🔍 Checking for the zip you sent or replied to...');
   let gitCwd = cwd;
+  const repliedZip = getZipDocumentFromContext(ctx);
+
+  if (repliedZip && !ctx.scene.state?.zipAlreadySaved) {
+    const savedZip = await saveTelegramZip(ctx, cwd, repliedZip);
+    await appendLog(userId, 'zip_saved', savedZip.name);
+    await ctx.reply(`✅ Saved zip to workspace: ${savedZip.name}`);
+  }
+
+  const zipListing = await listWorkspaceZips(cwd);
+  await ctx.reply(`📦 Workspace zip files (ls):
+
+\`\`\`
+${zipListing.slice(0, 3200)}
+\`\`\``);
+
   const latestZip = await findLatestZip(cwd);
 
   if (latestZip) {
