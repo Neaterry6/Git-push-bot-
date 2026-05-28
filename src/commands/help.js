@@ -5,6 +5,7 @@ function buildHelpText(prefix = '/') {
     `${prefix}help - show this help`,
     `${prefix}gitpush - start GitHub push flow`,
     `${prefix}run <command> - run shell command in your workspace`,
+    `${prefix}play <song name> - search and play a song`,
     `${prefix}workspace - list files/folders in your workspace`,
     `${prefix}getfile <relative-path> - download a file from workspace`,
     '',

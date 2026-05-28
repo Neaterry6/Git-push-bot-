@@ -46,6 +46,48 @@ bot.command('run', async (ctx) => {
   return runTerminalCommand(ctx, command, workspace.getPath(ctx.from.id));
 });
 
+
+bot.command('play', async (ctx) => {
+  const query = (ctx.message?.text || '').replace(/^\/play\s*/, '').trim();
+  if (!query) return ctx.reply('Usage: /play <song name>');
+
+  await appendLog(ctx.from.id, 'play_request', query);
+  await ctx.reply(`🎵 Searching for: ${query}`);
+
+  try {
+    const { data } = await axios.get('https://apis.davidcyril.name.ng/play', {
+      params: { query },
+      timeout: 60000,
+      headers: {
+        Accept: 'application/json',
+        'User-Agent': 'TelegramBot/1.0'
+      }
+    });
+
+    const song = extractPlayableSong(data);
+    if (!song.url) {
+      await appendLog(ctx.from.id, 'play_failed', JSON.stringify(data).slice(0, 300));
+      return ctx.reply('❌ I found a result, but the API did not return a playable audio URL. Try a different song name.');
+    }
+
+    const caption = [
+      song.title ? `🎶 ${song.title}` : '🎶 Song ready',
+      song.artist ? `👤 ${song.artist}` : '',
+      song.duration ? `⏱️ ${song.duration}` : '',
+      song.source ? `🔗 ${song.source}` : ''
+    ].filter(Boolean).join('\n');
+
+    try {
+      return await ctx.replyWithAudio({ url: song.url, filename: `${sanitizeFilename(song.title || query)}.mp3` }, { caption });
+    } catch (_audioError) {
+      return ctx.reply(`${caption}\n\n${song.url}`);
+    }
+  } catch (error) {
+    await appendLog(ctx.from.id, 'play_error', error.message);
+    return ctx.reply(`❌ Song search failed: ${error.response?.data?.message || error.message}`);
+  }
+});
+
 bot.command('logs', async (ctx) => {
   const output = await tailLogs(60);
   return ctx.reply(`🧾 Bot logs (latest):\n\n\`\`\`\n${output.slice(0, 3500)}\n\`\`\``);
@@ -181,6 +223,61 @@ function createZipFromFiles(files) {
 
     archive.finalize();
   });
+}
+
+
+function extractPlayableSong(payload) {
+  const urls = [];
+  collectUrls(payload, urls);
+
+  const audioUrl = urls.find((url) => /\.(mp3|m4a|wav|ogg)(\?|$)/i.test(url)) ||
+    urls.find((url) => /download|audio|play/i.test(url)) ||
+    urls[0];
+
+  const data = payload?.result || payload?.data || payload?.song || payload;
+  return {
+    url: audioUrl,
+    title: findFirstString(data, ['title', 'name', 'song', 'track']),
+    artist: findFirstString(data, ['artist', 'author', 'channel', 'uploader']),
+    duration: findFirstString(data, ['duration', 'timestamp', 'time']),
+    source: findFirstString(data, ['source', 'youtube', 'videoUrl', 'url', 'link', 'webpage_url'])
+  };
+}
+
+function collectUrls(value, urls) {
+  if (!value) return;
+  if (typeof value === 'string') {
+    if (/^https?:\/\//i.test(value)) urls.push(value);
+    return;
+  }
+  if (Array.isArray(value)) {
+    value.forEach((entry) => collectUrls(entry, urls));
+    return;
+  }
+  if (typeof value === 'object') {
+    for (const [key, nested] of Object.entries(value)) {
+      if (/thumbnail|image|avatar|cover/i.test(key)) continue;
+      collectUrls(nested, urls);
+    }
+  }
+}
+
+function findFirstString(value, keys) {
+  if (!value || typeof value !== 'object') return '';
+  for (const key of keys) {
+    if (typeof value[key] === 'string' && value[key].trim()) return value[key].trim();
+  }
+  for (const nested of Object.values(value)) {
+    if (nested && typeof nested === 'object') {
+      const found = findFirstString(nested, keys);
+      if (found) return found;
+    }
+  }
+  return '';
+}
+
+function sanitizeFilename(name) {
+  return String(name || 'song').replace(/[^a-z0-9._ -]/gi, '').slice(0, 80) || 'song';
 }
 
 console.log('Connecting to Telegram...');
