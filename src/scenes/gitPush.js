@@ -1,6 +1,7 @@
 const { Scenes } = require('telegraf');
 const path = require('path');
 const fs = require('fs-extra');
+const axios = require('axios');
 const exec = require('../utils/executor');
 const workspace = require('../utils/workspace');
 const { findLatestZip, getZipDocumentFromContext, listWorkspaceZips, saveTelegramZip, unzipFile } = require('../utils/fileHandler');
@@ -27,8 +28,180 @@ function normalizeRepoUrl(repoUrl) {
   return `https://github.com/${match[1]}/${match[2]}.git`;
 }
 
+function parseGitHubRepo(repoUrl) {
+  const match = String(repoUrl || '').match(/^https:\/\/github\.com\/([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+?)\.git$/);
+  if (!match) return null;
+  return { owner: match[1], repo: match[2] };
+}
+
 function buildAuthenticatedUrl(repoUrl, token) {
   return repoUrl.replace('https://', `https://x-access-token:${encodeURIComponent(token)}@`);
+}
+
+function getGitErrorText(error, token) {
+  return sanitizeGitOutput(error?.stderr || error?.message || error, token);
+}
+
+function isAuthOrTokenError(output) {
+  const text = String(output || '').toLowerCase();
+  return [
+    'authentication failed',
+    'bad credentials',
+    'invalid username or token',
+    'personal access token',
+    'token expired',
+    'expired token',
+    'could not read username',
+    'could not read password',
+    'support for password authentication was removed',
+    'password authentication is not supported',
+    'permission denied',
+    'http 401',
+    'http 403',
+    'github api 401',
+    'github api 403',
+  ].some((needle) => text.includes(needle));
+}
+
+function isRepoAccessError(output) {
+  const text = String(output || '').toLowerCase();
+  return text.includes('repository not found') || text.includes('github api 404: not found');
+}
+
+function isNonFastForwardError(output) {
+  const text = String(output || '').toLowerCase();
+  return text.includes('fetch first')
+    || text.includes('non-fast-forward')
+    || text.includes('failed to push some refs')
+    || text.includes('updates were rejected');
+}
+
+function isBranchProtectionError(output) {
+  const text = String(output || '').toLowerCase();
+  return text.includes('protected branch')
+    || text.includes('branch protection')
+    || text.includes('gh006')
+    || text.includes('cannot force-push')
+    || text.includes('protected branch hook declined');
+}
+
+function isStaleLeaseError(output) {
+  const text = String(output || '').toLowerCase();
+  return text.includes('stale info') || text.includes('fetch first');
+}
+
+function buildGitFailureHelp(output) {
+  const safeOutput = String(output || '');
+
+  if (isAuthOrTokenError(safeOutput)) {
+    return 'Your GitHub token was rejected or may be expired/revoked. Please create a new Personal Access Token with repo access for this repository, then run /gitpush again.';
+  }
+
+  if (isRepoAccessError(safeOutput)) {
+    return 'GitHub could not find the repository with this token. Check that the repo URL is exact and that your token owner has access to it.';
+  }
+
+  if (isStaleLeaseError(safeOutput)) {
+    return 'The remote branch changed while I was pushing. Run /gitpush again so I can create a fresh pull request branch, or integrate the remote commits manually.';
+  }
+
+  if (isNonFastForwardError(safeOutput) || isBranchProtectionError(safeOutput)) {
+    return 'The main branch could not be updated directly. I can push the upload to a new branch and open a pull request so the repo owner can review and merge it.';
+  }
+
+  return 'Checks:\n1) PAT is not expired/revoked and has repo scope/access\n2) Repo URL is exactly the repo you are viewing\n3) Files are not excluded by .gitignore\n4) Branch is main and branch protection allows this push.';
+}
+
+function buildPullRequestBranch(userId) {
+  const timestamp = new Date().toISOString().replace(/[-:.TZ]/g, '').slice(0, 14);
+  return `telegram-bot-upload-${userId}-${timestamp}`;
+}
+
+function getGitHubApiErrorText(error) {
+  const status = error?.response?.status;
+  const message = error?.response?.data?.message || error?.message || 'GitHub API request failed';
+  const errors = error?.response?.data?.errors;
+  const details = Array.isArray(errors)
+    ? errors.map((entry) => entry.message || entry.code).filter(Boolean).join('; ')
+    : '';
+  return [status ? `GitHub API ${status}` : null, message, details].filter(Boolean).join(': ');
+}
+
+async function createGitHubPullRequest(repoUrl, token, branchName) {
+  const repoInfo = parseGitHubRepo(repoUrl);
+  if (!repoInfo) {
+    throw new Error('Could not parse GitHub repository URL for pull request creation.');
+  }
+
+  const response = await axios.post(
+    `https://api.github.com/repos/${repoInfo.owner}/${repoInfo.repo}/pulls`,
+    {
+      title: INITIAL_COMMIT_MESSAGE,
+      head: branchName,
+      base: 'main',
+      body: 'Automated upload from Telegram Bot. Please review and merge this pull request if the changes look correct.',
+      maintainer_can_modify: true,
+    },
+    {
+      headers: {
+        Authorization: `Bearer ${token}`,
+        Accept: 'application/vnd.github+json',
+        'X-GitHub-Api-Version': '2022-11-28',
+      },
+    }
+  );
+
+  return response.data?.html_url;
+}
+
+async function createPullRequestBranchFromUpload(cwd, branchName) {
+  const uploadTree = (await exec('git rev-parse HEAD^{tree}', { cwd })).stdout.trim();
+
+  await exec('git fetch origin main', { cwd });
+  await exec(`git checkout -B ${shellQuote(branchName)} origin/main`, { cwd });
+  await exec(`git read-tree --reset -u ${shellQuote(uploadTree)}`, { cwd });
+
+  if (!(await hasStagedChanges(cwd))) {
+    throw new Error('The uploaded files already match the remote main branch, so there are no changes to open as a pull request.');
+  }
+
+  await exec(`git commit -m ${shellQuote(INITIAL_COMMIT_MESSAGE)}`, { cwd });
+}
+
+async function pushMainOrCreatePullRequest(ctx, cwd, repoUrl, token, userId) {
+  try {
+    await exec('git push -u origin main', { cwd });
+    return { mode: 'direct' };
+  } catch (pushError) {
+    const message = getGitErrorText(pushError, token);
+
+    if (isAuthOrTokenError(message) || isRepoAccessError(message)) {
+      throw new Error(message);
+    }
+
+    if (!isNonFastForwardError(message) && !isBranchProtectionError(message)) {
+      throw pushError;
+    }
+
+    const branchName = buildPullRequestBranch(userId);
+    await ctx.reply(`⚠️ Main branch push was rejected, so I will not force-push over the repo. I will push your upload to a new branch and open a pull request for you to review and merge.\n\nReason:\n\`\`\`\n${message.slice(0, 1800)}\n\`\`\``);
+
+    try {
+      await createPullRequestBranchFromUpload(cwd, branchName);
+      await exec(`git push -u origin ${shellQuote(branchName)}`, { cwd });
+    } catch (branchPushError) {
+      const branchPushMessage = getGitErrorText(branchPushError, token);
+      throw new Error(branchPushMessage);
+    }
+
+    try {
+      const pullRequestUrl = await createGitHubPullRequest(repoUrl, token, branchName);
+      return { mode: 'pull_request', branchName, pullRequestUrl };
+    } catch (pullRequestError) {
+      const pullRequestMessage = sanitizeGitOutput(getGitHubApiErrorText(pullRequestError), token);
+      throw new Error(`${pullRequestMessage}\n\nThe upload branch was pushed as ${branchName}, but I could not create the pull request. Your token may need Pull requests: Read and write permission, or an open pull request may already exist for this branch.`);
+    }
+  }
 }
 
 async function listDirectory(cwd) {
@@ -229,21 +402,20 @@ const gitPushScene = new Scenes.WizardScene(
       await ctx.reply(`✅ Ready to push branch: main\n\n\`\`\`\n${commitInfo.stdout.slice(0, 2500)}\n\`\`\``);
 
       await ctx.reply('9/9 Pushing files to GitHub main branch...');
-      try {
-        await exec('git push -u origin main', { cwd: gitCwd });
-      } catch (pushError) {
-        const message = sanitizeGitOutput(pushError.message, token);
-        await ctx.reply(`⚠️ Normal push failed. Retrying safely with --force-with-lease.\n\nReason:\n\`\`\`\n${message.slice(0, 1800)}\n\`\`\``);
-        await exec('git push -u origin main --force-with-lease', { cwd: gitCwd });
-      }
+      const pushResult = await pushMainOrCreatePullRequest(ctx, gitCwd, repoUrl, token, userId);
       await accessControl.incrementPush(userId);
 
       await appendLog(userId, 'gitpush_success', `repo=${repoUrl}`);
-      await ctx.reply(`✅ Push Successful!\n\nRepo: ${repoUrl.replace('.git', '')}\nBranch: main\nFiles were committed and pushed. If GitHub still looks empty, refresh and make sure the branch dropdown is set to main.`);
+      if (pushResult.mode === 'pull_request') {
+        await ctx.reply(`✅ Pull Request Created!\n\nRepo: ${repoUrl.replace('.git', '')}\nBranch: ${pushResult.branchName}\nPull Request: ${pushResult.pullRequestUrl}\n\nOpen the pull request link on GitHub, review the files, then merge it when you are ready.`);
+      } else {
+        await ctx.reply(`✅ Push Successful!\n\nRepo: ${repoUrl.replace('.git', '')}\nBranch: main\nFiles were committed and pushed. If GitHub still looks empty, refresh and make sure the branch dropdown is set to main.`);
+      }
     } catch (error) {
-      const safeError = sanitizeGitOutput(error.stderr || error.message, token);
+      const safeError = getGitErrorText(error, token);
+      const help = buildGitFailureHelp(safeError);
       await appendLog(userId, 'gitpush_failed', safeError);
-      await ctx.reply('❌ Push failed:\n' + safeError + '\n\nChecks:\n1) PAT has repo scope/access\n2) Repo URL is exactly the repo you are viewing\n3) Files are not excluded by .gitignore\n4) Branch is main and branch protection allows this push.');
+      await ctx.reply(`❌ Push failed:\n${safeError}\n\n${help}`);
     }
 
     return ctx.scene.leave();
