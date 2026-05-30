@@ -12,6 +12,35 @@ function setCwd(userId, cwd) {
   sessionCwd.set(userId, cwd);
 }
 
+function isInsideGitRepo(cwd) {
+  return fs.existsSync(path.join(cwd, '.git'));
+}
+
+function findGitRepo(startDir, maxDepth = 3) {
+  if (!startDir || !fs.existsSync(startDir)) return null;
+
+  const queue = [{ dir: startDir, depth: 0 }];
+  while (queue.length) {
+    const { dir, depth } = queue.shift();
+    if (isInsideGitRepo(dir)) return dir;
+    if (depth >= maxDepth) continue;
+
+    let entries = [];
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch (_error) {
+      continue;
+    }
+
+    for (const entry of entries) {
+      if (!entry.isDirectory() || entry.name === 'node_modules' || entry.name === '.git') continue;
+      queue.push({ dir: path.join(dir, entry.name), depth: depth + 1 });
+    }
+  }
+
+  return null;
+}
+
 async function run(userId, command, defaultCwd) {
   const trimmed = String(command || '').trim();
   const cwd = getCwd(userId, defaultCwd);
@@ -32,8 +61,22 @@ async function run(userId, command, defaultCwd) {
     return { output: `Changed directory to ${resolved}`, cwd: resolved };
   }
 
-  const result = await exec(trimmed, { cwd });
-  return { output: (result.stdout || result.stderr || 'Done').trim(), cwd };
+  let commandCwd = cwd;
+  if (/^git(?:\s|$)/.test(trimmed) && !findGitRepo(cwd, 0)) {
+    const repoCwd = findGitRepo(defaultCwd);
+    if (!repoCwd) {
+      return {
+        output: `Not a git repository: ${cwd}\nNo .git directory was found under your workspace. Run /gitpush first, upload a repository, or cd into a folder that contains .git.`,
+        cwd
+      };
+    }
+
+    commandCwd = repoCwd;
+    setCwd(userId, repoCwd);
+  }
+
+  const result = await exec(trimmed, { cwd: commandCwd });
+  return { output: (result.stdout || result.stderr || 'Done').trim(), cwd: commandCwd };
 }
 
-module.exports = { run, getCwd, setCwd };
+module.exports = { run, getCwd, setCwd, findGitRepo };

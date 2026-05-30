@@ -154,7 +154,7 @@ async function createGitHubPullRequest(repoUrl, token, branchName) {
   return response.data?.html_url;
 }
 
-async function createPullRequestBranchFromUpload(cwd, branchName) {
+async function overlayTreeOnRemoteMain(cwd, branchName, noChangeMessage) {
   const uploadTree = (await exec('git rev-parse HEAD^{tree}', { cwd })).stdout.trim();
 
   await exec('git fetch origin main', { cwd });
@@ -162,10 +162,44 @@ async function createPullRequestBranchFromUpload(cwd, branchName) {
   await exec(`git read-tree --reset -u ${shellQuote(uploadTree)}`, { cwd });
 
   if (!(await hasStagedChanges(cwd))) {
-    throw new Error('The uploaded files already match the remote main branch, so there are no changes to open as a pull request.');
+    throw new Error(noChangeMessage);
   }
 
   await exec(`git commit -m ${shellQuote(INITIAL_COMMIT_MESSAGE)}`, { cwd });
+}
+
+async function createPullRequestBranchFromUpload(cwd, branchName) {
+  await overlayTreeOnRemoteMain(
+    cwd,
+    branchName,
+    'The uploaded files already match the remote main branch, so there are no changes to open as a pull request.'
+  );
+}
+
+async function syncMainWithRemoteBeforePush(cwd) {
+  try {
+    await overlayTreeOnRemoteMain(
+      cwd,
+      'main',
+      'The uploaded files already match the remote main branch, so there is nothing new to push.'
+    );
+    return { synced: true, changed: true };
+  } catch (error) {
+    const message = String(error?.message || error);
+
+    if (
+      message.includes("couldn't find remote ref main")
+      || message.includes("fatal: couldn't find remote ref main")
+    ) {
+      return { synced: false, changed: true, reason: 'remote main does not exist yet' };
+    }
+
+    if (message.includes('nothing new to push')) {
+      return { synced: true, changed: false };
+    }
+
+    throw error;
+  }
 }
 
 async function pushMainOrCreatePullRequest(ctx, cwd, repoUrl, token, userId) {
@@ -397,11 +431,21 @@ const gitPushScene = new Scenes.WizardScene(
         await exec(`git remote set-url origin ${shellQuote(pushUrl)}`, { cwd: gitCwd });
       }
 
-      await ctx.reply('8/9 Confirming branch and latest commit...');
+      await ctx.reply('8/10 Syncing upload with the latest remote main branch...');
+      const syncResult = await syncMainWithRemoteBeforePush(gitCwd);
+      if (syncResult.synced && syncResult.changed) {
+        await ctx.reply('✅ Remote main was fetched, and your upload was committed on top of the latest remote main before pushing.');
+      } else if (syncResult.synced) {
+        await ctx.reply('ℹ️ Your upload already matches remote main. I will still verify whether a push is needed.');
+      } else {
+        await ctx.reply(`ℹ️ Skipping remote sync because ${syncResult.reason}.`);
+      }
+
+      await ctx.reply('9/10 Confirming branch and latest commit...');
       const commitInfo = await exec('git log -1 --stat --oneline', { cwd: gitCwd });
       await ctx.reply(`✅ Ready to push branch: main\n\n\`\`\`\n${commitInfo.stdout.slice(0, 2500)}\n\`\`\``);
 
-      await ctx.reply('9/9 Pushing files to GitHub main branch...');
+      await ctx.reply('10/10 Pushing files to GitHub main branch...');
       const pushResult = await pushMainOrCreatePullRequest(ctx, gitCwd, repoUrl, token, userId);
       await accessControl.incrementPush(userId);
 
