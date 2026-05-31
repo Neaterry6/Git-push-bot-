@@ -12,6 +12,59 @@ const GIT_AUTHOR_NAME = 'TelegramBot';
 const GIT_AUTHOR_EMAIL = 'bot@telegram.com';
 const INITIAL_COMMIT_MESSAGE = 'Initial commit from Telegram Bot';
 
+const SECRET_REDACTION_PLACEHOLDER = '[redacted-github-token]';
+const GITHUB_TOKEN_PATTERNS = [
+  /github_pat_[A-Za-z0-9_]{20,}/g,
+  /\bgh[pousr]_[A-Za-z0-9_]{20,}\b/g,
+];
+const SKIP_SECRET_SCAN_DIRS = new Set(['.git', 'node_modules', 'vendor', 'dist', 'build', '.next']);
+const MAX_SECRET_SCAN_FILE_BYTES = 1024 * 1024;
+
+function looksBinary(buffer) {
+  return buffer.includes(0);
+}
+
+async function redactGitHubTokensInWorkspace(cwd) {
+  const redactedFiles = [];
+
+  async function scanDirectory(directory) {
+    const entries = await fs.readdir(directory, { withFileTypes: true });
+
+    for (const entry of entries) {
+      if (entry.isSymbolicLink()) continue;
+      if (entry.isDirectory()) {
+        if (!SKIP_SECRET_SCAN_DIRS.has(entry.name)) {
+          await scanDirectory(path.join(directory, entry.name));
+        }
+        continue;
+      }
+
+      if (!entry.isFile()) continue;
+
+      const filePath = path.join(directory, entry.name);
+      const stat = await fs.stat(filePath);
+      if (stat.size > MAX_SECRET_SCAN_FILE_BYTES) continue;
+
+      const buffer = await fs.readFile(filePath);
+      if (looksBinary(buffer)) continue;
+
+      const original = buffer.toString('utf8');
+      let redacted = original;
+      for (const pattern of GITHUB_TOKEN_PATTERNS) {
+        redacted = redacted.replace(pattern, SECRET_REDACTION_PLACEHOLDER);
+      }
+
+      if (redacted !== original) {
+        await fs.writeFile(filePath, redacted, 'utf8');
+        redactedFiles.push(path.relative(cwd, filePath));
+      }
+    }
+  }
+
+  await scanDirectory(cwd);
+  return redactedFiles;
+}
+
 function shellQuote(value) {
   return `'${String(value).replace(/'/g, `'\\''`)}'`;
 }
@@ -42,7 +95,17 @@ function getGitErrorText(error, token) {
   return sanitizeGitOutput(error?.stderr || error?.message || error, token);
 }
 
+function isPushProtectionSecretError(output) {
+  const text = String(output || '').toLowerCase();
+  return text.includes('gh013')
+    || text.includes('github push protection')
+    || text.includes('push cannot contain secrets')
+    || text.includes('repository rule violations') && text.includes('secret');
+}
+
 function isAuthOrTokenError(output) {
+  if (isPushProtectionSecretError(output)) return false;
+
   const text = String(output || '').toLowerCase();
   return [
     'authentication failed',
@@ -92,6 +155,10 @@ function isStaleLeaseError(output) {
 
 function buildGitFailureHelp(output) {
   const safeOutput = String(output || '');
+
+  if (isPushProtectionSecretError(safeOutput)) {
+    return 'GitHub blocked the push because a secret is still present in the commit history or files. Remove the token from the uploaded project, rotate/revoke that exposed token, then run /gitpush again. A newly generated token is still a secret and GitHub will block it if it is committed.';
+  }
 
   if (isAuthOrTokenError(safeOutput)) {
     return 'Your GitHub token was rejected or may be expired/revoked. Please create a new Personal Access Token with repo access for this repository, then run /gitpush again.';
@@ -202,6 +269,27 @@ async function syncMainWithRemoteBeforePush(cwd) {
   }
 }
 
+async function pushPullRequestBranch(ctx, cwd, repoUrl, token, userId, reason) {
+  const branchName = buildPullRequestBranch(userId);
+  await ctx.reply(`⚠️ Main branch push still failed, so I will push your upload to a new branch and open a pull request for you to review and merge.\n\nReason:\n\`\`\`\n${reason.slice(0, 1800)}\n\`\`\``);
+
+  try {
+    await createPullRequestBranchFromUpload(cwd, branchName);
+    await exec(`git push -u origin ${shellQuote(branchName)}`, { cwd });
+  } catch (branchPushError) {
+    const branchPushMessage = getGitErrorText(branchPushError, token);
+    throw new Error(branchPushMessage);
+  }
+
+  try {
+    const pullRequestUrl = await createGitHubPullRequest(repoUrl, token, branchName);
+    return { mode: 'pull_request', branchName, pullRequestUrl };
+  } catch (pullRequestError) {
+    const pullRequestMessage = sanitizeGitOutput(getGitHubApiErrorText(pullRequestError), token);
+    throw new Error(`${pullRequestMessage}\n\nThe upload branch was pushed as ${branchName}, but I could not create the pull request. Your token may need Pull requests: Read and write permission, or an open pull request may already exist for this branch.`);
+  }
+}
+
 async function pushMainOrCreatePullRequest(ctx, cwd, repoUrl, token, userId) {
   try {
     await exec('git push -u origin main', { cwd });
@@ -209,7 +297,7 @@ async function pushMainOrCreatePullRequest(ctx, cwd, repoUrl, token, userId) {
   } catch (pushError) {
     const message = getGitErrorText(pushError, token);
 
-    if (isAuthOrTokenError(message) || isRepoAccessError(message)) {
+    if (isPushProtectionSecretError(message) || isAuthOrTokenError(message) || isRepoAccessError(message)) {
       throw new Error(message);
     }
 
@@ -217,23 +305,19 @@ async function pushMainOrCreatePullRequest(ctx, cwd, repoUrl, token, userId) {
       throw pushError;
     }
 
-    const branchName = buildPullRequestBranch(userId);
-    await ctx.reply(`⚠️ Main branch push was rejected, so I will not force-push over the repo. I will push your upload to a new branch and open a pull request for you to review and merge.\n\nReason:\n\`\`\`\n${message.slice(0, 1800)}\n\`\`\``);
+    await ctx.reply(`⚠️ Normal push to main failed. I will try a safer force push with lease once, then fall back to a pull request if GitHub still rejects it.\n\nReason:\n\`\`\`\n${message.slice(0, 1800)}\n\`\`\``);
 
     try {
-      await createPullRequestBranchFromUpload(cwd, branchName);
-      await exec(`git push -u origin ${shellQuote(branchName)}`, { cwd });
-    } catch (branchPushError) {
-      const branchPushMessage = getGitErrorText(branchPushError, token);
-      throw new Error(branchPushMessage);
-    }
+      await exec('git push --force-with-lease -u origin main', { cwd });
+      return { mode: 'force_direct' };
+    } catch (forcePushError) {
+      const forcePushMessage = getGitErrorText(forcePushError, token);
 
-    try {
-      const pullRequestUrl = await createGitHubPullRequest(repoUrl, token, branchName);
-      return { mode: 'pull_request', branchName, pullRequestUrl };
-    } catch (pullRequestError) {
-      const pullRequestMessage = sanitizeGitOutput(getGitHubApiErrorText(pullRequestError), token);
-      throw new Error(`${pullRequestMessage}\n\nThe upload branch was pushed as ${branchName}, but I could not create the pull request. Your token may need Pull requests: Read and write permission, or an open pull request may already exist for this branch.`);
+      if (isPushProtectionSecretError(forcePushMessage) || isAuthOrTokenError(forcePushMessage) || isRepoAccessError(forcePushMessage)) {
+        throw new Error(forcePushMessage);
+      }
+
+      return pushPullRequestBranch(ctx, cwd, repoUrl, token, userId, forcePushMessage);
     }
   }
 }
@@ -383,17 +467,26 @@ const gitPushScene = new Scenes.WizardScene(
     await appendLog(userId, 'gitpush_start', `repo=${repoUrl}`);
 
     try {
-      await ctx.reply('1/9 Initializing repository...');
+      await ctx.reply('1/11 Initializing clean repository metadata...');
+      await fs.remove(path.join(gitCwd, '.git'));
       await exec('git init', { cwd: gitCwd });
 
-      await ctx.reply('2/9 Configuring git author...');
+      await ctx.reply('2/11 Configuring git author...');
       await exec(`git config user.name ${shellQuote(GIT_AUTHOR_NAME)}`, { cwd: gitCwd });
       await exec(`git config user.email ${shellQuote(GIT_AUTHOR_EMAIL)}`, { cwd: gitCwd });
 
-      await ctx.reply('3/9 Switching to main branch...');
+      await ctx.reply('3/11 Switching to main branch...');
       await exec('git checkout -B main', { cwd: gitCwd });
 
-      await ctx.reply('4/9 Staging all visible files...');
+      await ctx.reply('4/11 Scanning project files for committed GitHub tokens...');
+      const redactedFiles = await redactGitHubTokensInWorkspace(gitCwd);
+      if (redactedFiles.length) {
+        await ctx.reply(`🧹 Removed committed GitHub token text from ${redactedFiles.length} file(s) before committing, because GitHub push protection blocks any PAT that is inside the repo. Rotate/revoke any token that was already pasted into project files.\n\nFiles changed:\n\`\`\`\n${redactedFiles.slice(0, 30).join('\n').slice(0, 2500)}\n\`\`\``);
+      } else {
+        await ctx.reply('✅ No committed GitHub token patterns found in project files.');
+      }
+
+      await ctx.reply('5/11 Staging all visible files...');
       await exec('git add -A', { cwd: gitCwd });
       const status = await getShortStatus(gitCwd);
       const ignoredFiles = await getIgnoredFiles(gitCwd);
@@ -412,7 +505,7 @@ const gitPushScene = new Scenes.WizardScene(
         await ctx.reply('ℹ️ No new local changes, but an existing commit is present and can be pushed.');
       }
 
-      await ctx.reply('5/9 Creating commit when needed...');
+      await ctx.reply('6/11 Creating commit when needed...');
       if (staged) {
         await exec(`git commit -m ${shellQuote(INITIAL_COMMIT_MESSAGE)}`, { cwd: gitCwd });
       } else {
@@ -421,17 +514,17 @@ const gitPushScene = new Scenes.WizardScene(
 
       const pushUrl = buildAuthenticatedUrl(repoUrl, token);
 
-      await ctx.reply('6/9 Verifying remote repository...');
+      await ctx.reply('7/11 Verifying remote repository...');
       await exec(`git ls-remote ${shellQuote(pushUrl)} HEAD`, { cwd: gitCwd });
 
-      await ctx.reply('7/9 Configuring remote origin...');
+      await ctx.reply('8/11 Configuring remote origin...');
       try {
         await exec(`git remote add origin ${shellQuote(pushUrl)}`, { cwd: gitCwd });
       } catch (_error) {
         await exec(`git remote set-url origin ${shellQuote(pushUrl)}`, { cwd: gitCwd });
       }
 
-      await ctx.reply('8/10 Syncing upload with the latest remote main branch...');
+      await ctx.reply('9/11 Syncing upload with the latest remote main branch...');
       const syncResult = await syncMainWithRemoteBeforePush(gitCwd);
       if (syncResult.synced && syncResult.changed) {
         await ctx.reply('✅ Remote main was fetched, and your upload was committed on top of the latest remote main before pushing.');
@@ -441,17 +534,19 @@ const gitPushScene = new Scenes.WizardScene(
         await ctx.reply(`ℹ️ Skipping remote sync because ${syncResult.reason}.`);
       }
 
-      await ctx.reply('9/10 Confirming branch and latest commit...');
+      await ctx.reply('10/11 Confirming branch and latest commit...');
       const commitInfo = await exec('git log -1 --stat --oneline', { cwd: gitCwd });
       await ctx.reply(`✅ Ready to push branch: main\n\n\`\`\`\n${commitInfo.stdout.slice(0, 2500)}\n\`\`\``);
 
-      await ctx.reply('10/10 Pushing files to GitHub main branch...');
+      await ctx.reply('11/11 Pushing files to GitHub main branch...');
       const pushResult = await pushMainOrCreatePullRequest(ctx, gitCwd, repoUrl, token, userId);
       await accessControl.incrementPush(userId);
 
       await appendLog(userId, 'gitpush_success', `repo=${repoUrl}`);
       if (pushResult.mode === 'pull_request') {
         await ctx.reply(`✅ Pull Request Created!\n\nRepo: ${repoUrl.replace('.git', '')}\nBranch: ${pushResult.branchName}\nPull Request: ${pushResult.pullRequestUrl}\n\nOpen the pull request link on GitHub, review the files, then merge it when you are ready.`);
+      } else if (pushResult.mode === 'force_direct') {
+        await ctx.reply(`✅ Force Push Successful!\n\nRepo: ${repoUrl.replace('.git', '')}\nBranch: main\nFiles were committed and pushed with --force-with-lease after the normal push failed. If GitHub still looks empty, refresh and make sure the branch dropdown is set to main.`);
       } else {
         await ctx.reply(`✅ Push Successful!\n\nRepo: ${repoUrl.replace('.git', '')}\nBranch: main\nFiles were committed and pushed. If GitHub still looks empty, refresh and make sure the branch dropdown is set to main.`);
       }
