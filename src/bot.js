@@ -3,18 +3,31 @@ const axios = require('axios');
 const fs = require('fs-extra');
 const path = require('path');
 const archiver = require('archiver');
-const { PassThrough } = require('stream');
 
 require('dotenv').config();
 
 const callClaudePro = require('./utils/claudePro');
 const workspace = require('./utils/workspace');
 const terminal = require('./utils/terminal');
+const agentTools = require('./tools');
 const gitPushScene = require('./scenes/gitPush');
 const { buildHelpText } = require('./commands/help');
 const accessControl = require('./utils/accessControl');
 const { appendLog, tailLogs } = require('./utils/logs');
 const { isZipFileName, listWorkspaceZips, saveTelegramZip } = require('./utils/fileHandler');
+
+
+const BRAIN = (process.env.BRAIN || 'groq').toLowerCase();
+const GROQ_API_KEY = process.env.GROQ_API_KEY;
+const GROQ_MODEL = process.env.GROQ_MODEL || 'llama-3.3-70b-versatile';
+const ALLOWED_USER_ID = process.env.ALLOWED_USER_ID ? Number.parseInt(process.env.ALLOWED_USER_ID, 10) : null;
+
+const SYSTEM_PROMPT = `You are an autonomous CLI agent controlling a server. You can:
+- Run terminal commands with exec
+- Create full project worktrees with createWorkTree
+- Zip folders and upload to gofile.io with zipAndUpload
+- Browse web, scrape sites, find APIs
+Always give feedback before/after actions. If user asks to create a project, use createWorkTree with full file contents, then zipAndUpload it.`;
 
 if (!process.env.BOT_TOKEN) {
   throw new Error('Missing BOT_TOKEN in environment.');
@@ -169,30 +182,118 @@ async function adminUserAction(ctx, action) {
 bot.on('text', async (ctx) => {
   const userText = (ctx.message?.text || '').trim();
   if (userText.length < 2 || userText.startsWith('/')) return;
+  if (ALLOWED_USER_ID && ctx.from.id !== ALLOWED_USER_ID) return ctx.reply('Unauthorized');
 
   const userId = ctx.from.id;
-  const cwd = workspace.getPath(userId);
 
   await appendLog(userId, 'chat_message', userText);
-  await ctx.reply('🧠 Thinking with Claude Pro...');
+  await ctx.sendChatAction('typing');
 
-  const intentPrompt = `Classify this user message into ONE category. Return ONLY valid JSON.\nUser: "${userText}"\n\nCategories:\n- chat → normal conversation\n- terminal → run shell/git command\n- build_app → create app with LlamaCoder\n- git_push → push code to GitHub\n\nResponse format:\n{"intent": "chat|terminal|build_app|git_push", "command": "...", "app_prompt": "..."}`;
+  const sendFeedback = async (msg) => {
+    await ctx.reply(`⏳ ${String(msg).slice(0, 3500)}`);
+  };
 
-  let intent = { intent: 'chat' };
-  const intentText = await callClaudePro(userId, intentPrompt);
   try {
-    intent = JSON.parse(intentText);
-  } catch (_error) {
-    intent = { intent: 'chat' };
+    const result = await runAgent(userText, [], sendFeedback, userId);
+
+    if (result && typeof result === 'object' && result.type === 'url') {
+      await ctx.reply(`✅ Done. Download: ${result.url}`);
+    } else {
+      await ctx.reply(`✅ ${String(result || 'Done').slice(0, 3500)}`);
+    }
+  } catch (error) {
+    await appendLog(userId, 'agent_error', error.message);
+    await ctx.reply(`❌ Error: ${error.message}`);
+  }
+});
+
+async function executeToolCall(name, args, sendFeedback) {
+  if (sendFeedback) await sendFeedback(`Calling tool: ${name}`);
+  switch (name) {
+    case 'exec': return agentTools.execTool(args.command, sendFeedback);
+    case 'zipAndUpload': return agentTools.zipAndUpload(args.path, sendFeedback);
+    case 'createWorkTree': return agentTools.createWorkTree(args.rootDir, args.files, sendFeedback);
+    case 'webSearch': return agentTools.webSearch(args.query, sendFeedback);
+    case 'fetchUrl': return agentTools.fetchUrl(args.url, sendFeedback);
+    case 'scrapeSite': return agentTools.scrapeSite(args.url, args.maxDepth, sendFeedback);
+    case 'findAPIs': return agentTools.findAPIs(args.url, sendFeedback);
+    default: throw new Error(`Unknown tool: ${name}`);
+  }
+}
+
+async function runAgent(userMsg, history = [], sendFeedback, userId, depth = 0) {
+  if (depth > 8) throw new Error('Tool recursion limit reached');
+  const messages = [
+    { role: 'system', content: SYSTEM_PROMPT },
+    ...history.map((h) => ({ role: h.role, content: h.parts?.[0]?.text || h.content })),
+    { role: 'user', content: userMsg }
+  ];
+
+  if (BRAIN === 'groq' && GROQ_API_KEY) {
+    try {
+      const resp = await axios.post(
+        'https://api.groq.com/openai/v1/chat/completions',
+        {
+          model: GROQ_MODEL,
+          messages,
+          tools: agentTools.tools.map((t) => ({
+            type: 'function',
+            function: { name: t.name, description: t.description, parameters: t.parameters }
+          })),
+          tool_choice: 'auto'
+        },
+        {
+          timeout: 120000,
+          headers: {
+            Authorization: `Bearer ${GROQ_API_KEY}`,
+            'Content-Type': 'application/json'
+          }
+        }
+      );
+
+      const msg = resp.data?.choices?.[0]?.message;
+      if (msg?.tool_calls?.length) {
+        let lastResult;
+        for (const call of msg.tool_calls) {
+          const parsedArgs = JSON.parse(call.function.arguments || '{}');
+          lastResult = await executeToolCall(call.function.name, parsedArgs, sendFeedback);
+        }
+        return runAgent(`Tool result: ${JSON.stringify(lastResult)}`, [...history, { role: 'user', content: userMsg }], sendFeedback, userId, depth + 1);
+      }
+      return msg?.content || 'Done';
+    } catch (error) {
+      const status = error.response?.status;
+      if (sendFeedback) await sendFeedback(`Groq unavailable${status ? ` (${status})` : ''}; falling back to Claude Pro...`);
+      return runClaudeFallbackAgent(userMsg, history, sendFeedback, userId, depth);
+    }
   }
 
-  if (intent.intent === 'build_app') return handleLlamaCoder(ctx, intent.app_prompt || userText, cwd);
-  if (intent.intent === 'git_push') return ctx.scene.enter('gitPush');
-  if (intent.intent === 'terminal' && intent.command) return runTerminalCommand(ctx, intent.command, cwd);
+  return runClaudeFallbackAgent(userMsg, history, sendFeedback, userId, depth);
+}
 
-  const response = await callClaudePro(userId, userText);
-  return ctx.reply(response);
-});
+async function runClaudeFallbackAgent(userMsg, history = [], sendFeedback, userId, depth = 0) {
+  if (depth > 8) throw new Error('Tool recursion limit reached');
+  const toolNames = agentTools.tools.map((t) => t.name).join(', ');
+  const prompt = `${SYSTEM_PROMPT}
+
+You are in fallback mode. Available tools: ${toolNames}.
+Return ONLY JSON. To call a tool return {"tool":"toolName","args":{...}}. To answer return {"final":"message"}.
+User/task: ${userMsg}`;
+  const raw = await callClaudePro(userId, prompt);
+  let parsed;
+  try {
+    parsed = JSON.parse(raw.replace(/^```json\s*/i, '').replace(/```$/i, '').trim());
+  } catch (_error) {
+    return raw;
+  }
+
+  if (parsed.tool) {
+    const result = await executeToolCall(parsed.tool, parsed.args || {}, sendFeedback);
+    return runClaudeFallbackAgent(`Tool result: ${JSON.stringify(result)}`, [...history, { role: 'user', content: userMsg }], sendFeedback, userId, depth + 1);
+  }
+
+  return parsed.final || raw;
+}
 
 async function runTerminalCommand(ctx, command, cwd) {
   await appendLog(ctx.from.id, 'terminal_run', command);
@@ -220,42 +321,17 @@ async function handleLlamaCoder(ctx, prompt, cwd) {
       return ctx.reply(data?.rawOutput || 'No files generated.');
     }
 
-    for (const file of data.files) {
-      const filePath = path.join(cwd, file.path || 'src/index.tsx');
-      await fs.ensureDir(path.dirname(filePath));
-      await fs.writeFile(filePath, file.content || '');
-    }
+    const rootDir = path.join(cwd, `app-${Date.now()}`);
+    const sendFeedback = async (msg) => ctx.reply(`⏳ ${msg}`);
+    await agentTools.createWorkTree(rootDir, data.files, sendFeedback);
+    const upload = await agentTools.zipAndUpload(rootDir, sendFeedback);
 
-    await ctx.reply(`✅ App saved to workspace! ${data.files.length} files created.`);
-    const zipBuffer = await createZipFromFiles(data.files);
-
-    await ctx.replyWithDocument({ source: zipBuffer, filename: `app-${Date.now()}.zip` });
-    return null;
+    return ctx.reply(`✅ App saved and uploaded: ${upload.url}`);
   } catch (error) {
     return ctx.reply(`Build failed: ${error.message}`);
   }
 }
 
-function createZipFromFiles(files) {
-  return new Promise((resolve, reject) => {
-    const pass = new PassThrough();
-    const chunks = [];
-
-    pass.on('data', (chunk) => chunks.push(chunk));
-    pass.on('end', () => resolve(Buffer.concat(chunks)));
-    pass.on('error', reject);
-
-    const archive = archiver('zip', { zlib: { level: 9 } });
-    archive.on('error', reject);
-    archive.pipe(pass);
-
-    for (const file of files) {
-      archive.append(file.content || '', { name: file.path || 'src/index.tsx' });
-    }
-
-    archive.finalize();
-  });
-}
 
 
 function extractPlayableSong(payload) {
