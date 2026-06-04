@@ -94,9 +94,59 @@ async function listWorkspaceZips(cwd) {
   return formatZipListing(await findZipFiles(cwd));
 }
 
-async function unzipFile(zipPath, destination) {
-  const zip = new AdmZip(zipPath);
-  zip.extractAllTo(destination, true);
+function isIgnoredExtractionEntry(name) {
+  return name === '__MACOSX' || name === '.DS_Store';
+}
+
+async function getSingleExtractedRoot(directory) {
+  const entries = await fs.readdir(directory, { withFileTypes: true }).catch(() => []);
+  const contentEntries = entries.filter((entry) => !isIgnoredExtractionEntry(entry.name));
+
+  if (contentEntries.length !== 1 || !contentEntries[0].isDirectory()) {
+    return { root: directory, strippedRoot: null };
+  }
+
+  const strippedRoot = contentEntries[0].name;
+  return {
+    root: path.join(directory, strippedRoot),
+    strippedRoot
+  };
+}
+
+async function moveExtractedContents(source, destination) {
+  await fs.ensureDir(destination);
+  const entries = await fs.readdir(source);
+
+  for (const entry of entries) {
+    const from = path.join(source, entry);
+    const to = path.join(destination, entry);
+    await fs.move(from, to, { overwrite: true });
+  }
+}
+
+async function unzipFile(zipPath, destination, options = {}) {
+  const { stripSingleRoot = true } = options;
+  const tempDestination = `${destination}.tmp-${Date.now()}`;
+
+  await fs.remove(destination);
+  await fs.remove(tempDestination);
+  await fs.ensureDir(tempDestination);
+
+  try {
+    const zip = new AdmZip(zipPath);
+    zip.extractAllTo(tempDestination, true);
+
+    const { root, strippedRoot } = stripSingleRoot
+      ? await getSingleExtractedRoot(tempDestination)
+      : { root: tempDestination, strippedRoot: null };
+
+    await fs.ensureDir(destination);
+    await moveExtractedContents(root, destination);
+
+    return { strippedRoot };
+  } finally {
+    await fs.remove(tempDestination);
+  }
 }
 
 module.exports = {

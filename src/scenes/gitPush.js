@@ -391,9 +391,11 @@ ${zipListing.slice(0, 3200)}
   if (latestZip) {
     await ctx.reply(`📦 Found ${latestZip.name}. Unzipping now...`);
     const extractedDir = path.join(cwd, 'extracted');
-    await fs.remove(extractedDir);
-    await unzipFile(latestZip.fullPath, extractedDir);
+    const unzipResult = await unzipFile(latestZip.fullPath, extractedDir);
     gitCwd = extractedDir;
+    if (unzipResult.strippedRoot) {
+      await ctx.reply(`📂 Removed zip wrapper folder \`${unzipResult.strippedRoot}\` so files will be pushed to the GitHub repo root instead of inside that folder.`);
+    }
     await appendLog(userId, 'zip_unzipped', latestZip.name);
   }
 
