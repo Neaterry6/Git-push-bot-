@@ -7,6 +7,8 @@ const archiver = require('archiver');
 require('dotenv').config();
 
 const callClaudePro = require('./utils/claudePro');
+const { askGemini } = require('./utils/ai');
+const historyManager = require('./utils/history');
 const workspace = require('./utils/workspace');
 const terminal = require('./utils/terminal');
 const agentTools = require('./tools');
@@ -23,11 +25,12 @@ const GROQ_MODEL = process.env.GROQ_MODEL || 'llama-3.3-70b-versatile';
 const ALLOWED_USER_ID = process.env.ALLOWED_USER_ID ? Number.parseInt(process.env.ALLOWED_USER_ID, 10) : null;
 
 const SYSTEM_PROMPT = `You are an autonomous CLI agent controlling a server. You can:
-- Run terminal commands with exec
+- Run terminal commands with exec, including installing missing tools/modules when needed
 - Create full project worktrees with createWorkTree
 - Zip folders and upload to gofile.io with zipAndUpload
 - Browse web, scrape sites, find APIs
-Always give feedback before/after actions. If user asks to create a project, use createWorkTree with full file contents, then zipAndUpload it.`;
+- Take website screenshots with screenshot
+Always give feedback before/after actions. If user asks you to scrape, generate code, install dependencies, or build a project, you must run the code/command and report the console output. If a command fails, diagnose it, install missing dependencies/tools if safe, retry with another approach, and only stop after every reasonable method fails. If output is a single short script, you may paste it in chat; if there are many files, zipAndUpload the folder to gofile.io. Remember and use the saved chat history, user profile, and memories provided in the prompt.`;
 
 if (!process.env.BOT_TOKEN) {
   throw new Error('Missing BOT_TOKEN in environment.');
@@ -187,6 +190,15 @@ bot.on('text', async (ctx) => {
   const userId = ctx.from.id;
 
   await appendLog(userId, 'chat_message', userText);
+  historyManager.addMessage(userId, 'user', userText);
+  historyManager.updateProfile(userId, {
+    username: ctx.from.username || '',
+    firstName: ctx.from.first_name || '',
+    lastName: ctx.from.last_name || ''
+  });
+  if (/\bremember\b|\bmy\s+name\b|\bcall me\b|\bi like\b|\bi prefer\b/i.test(userText)) {
+    historyManager.addMemory(userId, userText, 'user');
+  }
   await ctx.sendChatAction('typing');
 
   const sendFeedback = async (msg) => {
@@ -196,11 +208,8 @@ bot.on('text', async (ctx) => {
   try {
     const result = await runAgent(userText, [], sendFeedback, userId);
 
-    if (result && typeof result === 'object' && result.type === 'url') {
-      await ctx.reply(`✅ Done. Download: ${result.url}`);
-    } else {
-      await ctx.reply(`✅ ${String(result || 'Done').slice(0, 3500)}`);
-    }
+    await deliverAgentResult(ctx, result);
+    historyManager.addMessage(userId, 'assistant', typeof result === 'string' ? result : JSON.stringify(result).slice(0, 8000));
   } catch (error) {
     await appendLog(userId, 'agent_error', error.message);
     await ctx.reply(`❌ Error: ${error.message}`);
@@ -216,18 +225,65 @@ async function executeToolCall(name, args, sendFeedback) {
     case 'webSearch': return agentTools.webSearch(args.query, sendFeedback);
     case 'fetchUrl': return agentTools.fetchUrl(args.url, sendFeedback);
     case 'scrapeSite': return agentTools.scrapeSite(args.url, args.maxDepth, sendFeedback);
+    case 'screenshot': return agentTools.screenshot(args.url, args.path, args.fullPage, sendFeedback);
     case 'findAPIs': return agentTools.findAPIs(args.url, sendFeedback);
     default: throw new Error(`Unknown tool: ${name}`);
   }
 }
 
-async function runAgent(userMsg, history = [], sendFeedback, userId, depth = 0) {
-  if (depth > 8) throw new Error('Tool recursion limit reached');
-  const messages = [
-    { role: 'system', content: SYSTEM_PROMPT },
+function shouldDeliverToolResult(toolName, result) {
+  return ['screenshot', 'scrapeSite', 'zipAndUpload'].includes(toolName) || Boolean(result?.path || result?.savedPath || result?.type === 'url');
+}
+
+function buildMessages(userMsg, history, userId) {
+  const memoryContext = historyManager.formatMemoryContext(userId);
+  const contextBlock = memoryContext ? `\n\n${memoryContext}` : '';
+  const persistedHistory = historyManager.getMessages(userId, 18);
+  return [
+    { role: 'system', content: `${SYSTEM_PROMPT}${contextBlock}` },
+    ...persistedHistory.map((h) => ({ role: h.role === 'assistant' ? 'assistant' : 'user', content: h.content })),
     ...history.map((h) => ({ role: h.role, content: h.parts?.[0]?.text || h.content })),
     { role: 'user', content: userMsg }
   ];
+}
+
+function stripJsonFence(raw) {
+  return String(raw || '').replace(/^```json\s*/i, '').replace(/^```\s*/i, '').replace(/```$/i, '').trim();
+}
+
+function parseToolJson(raw) {
+  try {
+    return JSON.parse(stripJsonFence(raw));
+  } catch (_error) {
+    const match = stripJsonFence(raw).match(/\{[\s\S]*\}/);
+    if (!match) return null;
+    try {
+      return JSON.parse(match[0]);
+    } catch (__error) {
+      return null;
+    }
+  }
+}
+
+async function deliverAgentResult(ctx, result) {
+  if (result && typeof result === 'object') {
+    if (result.type === 'url') return ctx.reply(`✅ Done. Download: ${result.url}`);
+    if (result.path && await fs.pathExists(result.path)) {
+      await ctx.reply(`✅ Done. File created: ${result.path}`);
+      return ctx.replyWithDocument({ source: result.path });
+    }
+    if (result.savedPath && await fs.pathExists(result.savedPath)) {
+      await ctx.reply(`✅ Done. Scrape saved: ${result.savedPath}\n\nConsole output:\n\`\`\`\n${String(result.consoleOutput || '').slice(0, 2500)}\n\`\`\``);
+      return ctx.replyWithDocument({ source: result.savedPath });
+    }
+    return ctx.reply(`✅ ${JSON.stringify(result, null, 2).slice(0, 3500)}`);
+  }
+  return ctx.reply(`✅ ${String(result || 'Done').slice(0, 3500)}`);
+}
+
+async function runAgent(userMsg, history = [], sendFeedback, userId, depth = 0) {
+  if (depth > 8) throw new Error('Tool recursion limit reached');
+  const messages = buildMessages(userMsg, history, userId);
 
   if (BRAIN === 'groq' && GROQ_API_KEY) {
     try {
@@ -257,6 +313,7 @@ async function runAgent(userMsg, history = [], sendFeedback, userId, depth = 0) 
         for (const call of msg.tool_calls) {
           const parsedArgs = JSON.parse(call.function.arguments || '{}');
           lastResult = await executeToolCall(call.function.name, parsedArgs, sendFeedback);
+          if (shouldDeliverToolResult(call.function.name, lastResult)) return lastResult;
         }
         return runAgent(`Tool result: ${JSON.stringify(lastResult)}`, [...history, { role: 'user', content: userMsg }], sendFeedback, userId, depth + 1);
       }
@@ -268,28 +325,60 @@ async function runAgent(userMsg, history = [], sendFeedback, userId, depth = 0) 
     }
   }
 
+  if (BRAIN === 'gemini') return runGeminiFallbackAgent(userMsg, history, sendFeedback, userId, depth);
   return runClaudeFallbackAgent(userMsg, history, sendFeedback, userId, depth);
 }
 
 async function runClaudeFallbackAgent(userMsg, history = [], sendFeedback, userId, depth = 0) {
   if (depth > 8) throw new Error('Tool recursion limit reached');
   const toolNames = agentTools.tools.map((t) => t.name).join(', ');
-  const prompt = `${SYSTEM_PROMPT}
+  const prompt = `${SYSTEM_PROMPT}\n\n${historyManager.formatMemoryContext(userId)}
 
-You are in fallback mode. Available tools: ${toolNames}.
+You are Claude Pro fallback mode in a three-model chain (Groq -> Claude Pro -> Gemini). Available tools: ${toolNames}.
 Return ONLY JSON. To call a tool return {"tool":"toolName","args":{...}}. To answer return {"final":"message"}.
+If a scrape/build/install task produced code or data, make sure a tool has run it and include console output in your final.
 User/task: ${userMsg}`;
-  const raw = await callClaudePro(userId, prompt);
-  let parsed;
+
+  let raw;
   try {
-    parsed = JSON.parse(raw.replace(/^```json\s*/i, '').replace(/```$/i, '').trim());
-  } catch (_error) {
-    return raw;
+    raw = await callClaudePro(userId, prompt);
+    if (/^Claude Pro Error:/i.test(raw)) throw new Error(raw);
+  } catch (error) {
+    if (sendFeedback) await sendFeedback(`Claude Pro unavailable; falling back to Gemini...`);
+    return runGeminiFallbackAgent(userMsg, history, sendFeedback, userId, depth);
   }
 
+  const parsed = parseToolJson(raw);
+  if (!parsed) return raw;
+
+  if (parsed.memory) historyManager.addMemory(userId, parsed.memory, 'claude');
   if (parsed.tool) {
     const result = await executeToolCall(parsed.tool, parsed.args || {}, sendFeedback);
+    if (shouldDeliverToolResult(parsed.tool, result)) return result;
     return runClaudeFallbackAgent(`Tool result: ${JSON.stringify(result)}`, [...history, { role: 'user', content: userMsg }], sendFeedback, userId, depth + 1);
+  }
+
+  return parsed.final || raw;
+}
+
+async function runGeminiFallbackAgent(userMsg, history = [], sendFeedback, userId, depth = 0) {
+  if (depth > 8) throw new Error('Tool recursion limit reached');
+  const toolNames = agentTools.tools.map((t) => t.name).join(', ');
+  const messages = buildMessages(
+    `You are Gemini fallback mode in a three-model chain (Groq -> Claude Pro -> Gemini). Available tools: ${toolNames}. Return ONLY JSON. To call a tool return {"tool":"toolName","args":{...}}. To answer return {"final":"message"}. If a scrape/build/install task produced code or data, make sure a tool has run it and include console output in your final. User/task: ${userMsg}`,
+    history,
+    userId
+  );
+
+  const raw = await askGemini(messages);
+  const parsed = parseToolJson(raw);
+  if (!parsed) return raw;
+
+  if (parsed.memory) historyManager.addMemory(userId, parsed.memory, 'gemini');
+  if (parsed.tool) {
+    const result = await executeToolCall(parsed.tool, parsed.args || {}, sendFeedback);
+    if (shouldDeliverToolResult(parsed.tool, result)) return result;
+    return runGeminiFallbackAgent(`Tool result: ${JSON.stringify(result)}`, [...history, { role: 'user', content: userMsg }], sendFeedback, userId, depth + 1);
   }
 
   return parsed.final || raw;

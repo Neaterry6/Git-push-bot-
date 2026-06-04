@@ -4,7 +4,9 @@
   "description": "Smart memory-enabled Telegram terminal and coding assistant bot",
   "main": "bot.js",
   "scripts": {
-    "start": "node bot.js"
+    "start": "node bot.js",
+    "check": "node --check src/bot.js && node --check src/tools.js && node --check src/utils/history.js && node --check src/utils/ai.js && node --check src/utils/claudePro.js && node --check src/utils/executor.js",
+    "test": "npm run check"
   },
   "dependencies": {
     "adm-zip": "^0.5.16",

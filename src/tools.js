@@ -1,6 +1,7 @@
 const fs = require('fs');
 const fsp = require('fs/promises');
 const path = require('path');
+const os = require('os');
 const archiver = require('archiver');
 const axios = require('axios');
 const cheerio = require('cheerio');
@@ -8,11 +9,12 @@ const { chromium } = require('playwright');
 const FormData = require('form-data');
 
 const GOFILE_API = 'https://api.gofile.io';
+const MAX_EXEC_ATTEMPTS = 3;
 
 const tools = [
   {
     name: 'exec',
-    description: 'Run a terminal command and return stdout/stderr. Args: {command: string}',
+    description: 'Run a terminal command and return stdout/stderr. Automatically retries common install/disk/browser-download failures. Args: {command: string}',
     parameters: {
       type: 'object',
       properties: { command: { type: 'string' } },
@@ -39,12 +41,25 @@ const tools = [
   },
   {
     name: 'scrapeSite',
-    description: 'Scrape a website with Playwright and return page titles, links, and text. Args: {url: string, maxDepth?: number}',
+    description: 'Scrape a website, save scraped JSON in the workspace/tmp folder, and return page titles, links, text, savedPath, and console output from validation. Args: {url: string, maxDepth?: number}',
     parameters: {
       type: 'object',
       properties: {
         url: { type: 'string' },
         maxDepth: { type: 'number' }
+      },
+      required: ['url']
+    }
+  },
+  {
+    name: 'screenshot',
+    description: 'Take a screenshot of a website with Playwright and return the saved image path. Args: {url: string, path?: string, fullPage?: boolean}',
+    parameters: {
+      type: 'object',
+      properties: {
+        url: { type: 'string' },
+        path: { type: 'string' },
+        fullPage: { type: 'boolean' }
       },
       required: ['url']
     }
@@ -87,14 +102,80 @@ const tools = [
   }
 ];
 
+function getInstallSafeEnv() {
+  const cacheRoot = process.env.BOT_CACHE_DIR || path.join(os.tmpdir(), 'git-push-bot-cache');
+  return {
+    ...process.env,
+    PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: process.env.PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD || '1',
+    PUPPETEER_SKIP_DOWNLOAD: process.env.PUPPETEER_SKIP_DOWNLOAD || '1',
+    PUPPETEER_SKIP_CHROMIUM_DOWNLOAD: process.env.PUPPETEER_SKIP_CHROMIUM_DOWNLOAD || '1',
+    npm_config_cache: process.env.npm_config_cache || path.join(cacheRoot, 'npm'),
+    YARN_CACHE_FOLDER: process.env.YARN_CACHE_FOLDER || path.join(cacheRoot, 'yarn'),
+    PNPM_HOME: process.env.PNPM_HOME || path.join(cacheRoot, 'pnpm')
+  };
+}
+
+function isInstallCommand(command) {
+  return /(^|\s)(npm|pnpm|yarn|bun)\s+(i|install|add)\b/i.test(command) || /npx\s+playwright\s+install/i.test(command);
+}
+
+function looksLikeDiskFailure(output) {
+  return /ENOSPC|no space left on device|insufficient disk|disk quota/i.test(output || '');
+}
+
+function appendInstallGuards(command) {
+  if (/^\s*npm\s+(i|install)\b/i.test(command) && !/--ignore-scripts/.test(command)) {
+    return `${command} --no-audit --no-fund`;
+  }
+  return command;
+}
+
+async function cleanInstallCaches(sendFeedback) {
+  const { execa } = await import('execa');
+  const cleanupCommands = [
+    'npm cache clean --force',
+    'rm -rf /tmp/git-push-bot-cache /tmp/ms-playwright /tmp/playwright-* ~/.cache/ms-playwright ~/.cache/puppeteer'
+  ];
+  for (const command of cleanupCommands) {
+    if (sendFeedback) await sendFeedback(`Freeing disk space: ${command}`);
+    await execa(command, { shell: true, timeout: 120000, all: true, reject: false, env: getInstallSafeEnv() });
+  }
+}
+
 async function execTool(command, sendFeedback) {
-  const blocked = ['rm -rf', 'dd ', 'mkfs', ':(){'];
+  const blocked = ['rm -rf /', 'dd ', 'mkfs', ':(){'];
   if (blocked.some((b) => command.includes(b))) throw new Error('Blocked command');
 
-  if (sendFeedback) await sendFeedback(`Running: ${command}`);
+  const baseCommand = String(command || '').trim();
+  if (!baseCommand) throw new Error('No command provided');
 
+  let lastOutput = '';
+  for (let attempt = 1; attempt <= MAX_EXEC_ATTEMPTS; attempt += 1) {
+    const guardedCommand = isInstallCommand(baseCommand) ? appendInstallGuards(baseCommand) : baseCommand;
+    if (sendFeedback) await sendFeedback(`Running${attempt > 1 ? ` retry ${attempt}/${MAX_EXEC_ATTEMPTS}` : ''}: ${guardedCommand}`);
+
+    try {
+      const output = await runCommand(guardedCommand, sendFeedback, getInstallSafeEnv());
+      if (sendFeedback) await sendFeedback(`Done. Console output:\n${output.slice(0, 900)}`);
+      return output;
+    } catch (error) {
+      lastOutput = error.message || String(error);
+      if (sendFeedback) await sendFeedback(`Command failed. Console output:\n${lastOutput.slice(0, 900)}`);
+
+      if (attempt < MAX_EXEC_ATTEMPTS && (looksLikeDiskFailure(lastOutput) || isInstallCommand(baseCommand))) {
+        await cleanInstallCaches(sendFeedback);
+        continue;
+      }
+      break;
+    }
+  }
+
+  throw new Error(lastOutput || 'Command failed');
+}
+
+async function runCommand(command, sendFeedback, env) {
   const { execa } = await import('execa');
-  const subprocess = execa(command, { shell: true, timeout: 60000, all: true });
+  const subprocess = execa(command, { shell: true, timeout: 180000, all: true, env });
   let output = '';
   let lastFeedback = 0;
 
@@ -104,25 +185,17 @@ async function execTool(command, sendFeedback) {
       const now = Date.now();
       if (sendFeedback && now - lastFeedback > 1500) {
         lastFeedback = now;
-        await sendFeedback(`Output: ${output.slice(-500)}`).catch(() => {});
+        await sendFeedback(`Output:\n${output.slice(-700)}`).catch(() => {});
       }
     });
   }
 
-  try {
-    const result = await subprocess;
-    output = (output || result.all || result.stdout || result.stderr || 'Command executed').trim();
-    if (sendFeedback) await sendFeedback(`Done. Output: ${output.slice(0, 500)}`);
-    return output;
-  } catch (error) {
-    output = (output || error.all || error.stdout || error.stderr || error.message).trim();
-    if (sendFeedback) await sendFeedback(`Command failed. Output: ${output.slice(0, 500)}`);
-    throw new Error(output || error.message);
-  }
+  const result = await subprocess;
+  return (output || result.all || result.stdout || result.stderr || 'Command executed').trim();
 }
 
 async function zipAndUpload(targetPath, sendFeedback) {
-  const zipPath = `/tmp/${Date.now()}.zip`;
+  const zipPath = path.join(os.tmpdir(), `${Date.now()}.zip`);
   const resolvedPath = path.resolve(targetPath);
   const stats = await fsp.stat(resolvedPath);
 
@@ -181,7 +254,7 @@ async function createWorkTree(rootDir, files, sendFeedback) {
   }
 
   if (sendFeedback) await sendFeedback(`Project created. Total files: ${files.length}`);
-  return `Created ${files.length} files in ${rootDir}`;
+  return { rootDir: root, fileCount: files.length, files: files.map((file) => file.path) };
 }
 
 async function webSearch(query, sendFeedback) {
@@ -208,25 +281,89 @@ async function fetchUrl(url, sendFeedback) {
   const { data } = await axios.get(url, {
     timeout: 60000,
     headers: { 'User-Agent': 'Mozilla/5.0 TelegramBot/1.0' },
-    responseType: 'text'
+    responseType: 'text',
+    validateStatus: () => true
   });
   const text = typeof data === 'string' ? cheerio.load(data).text().replace(/\s+/g, ' ').trim() : JSON.stringify(data);
   if (sendFeedback) await sendFeedback(`Fetched ${url}. Characters: ${text.length}`);
   return text.slice(0, 12000);
 }
 
+function findBrowserExecutable() {
+  const candidates = [
+    process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH,
+    process.env.CHROME_BIN,
+    '/usr/bin/google-chrome-stable',
+    '/usr/bin/google-chrome',
+    '/usr/bin/chromium-browser',
+    '/usr/bin/chromium'
+  ].filter(Boolean);
+  return candidates.find((candidate) => fs.existsSync(candidate));
+}
+
+async function launchBrowser(sendFeedback) {
+  const executablePath = findBrowserExecutable();
+  const options = { headless: true };
+  if (executablePath) {
+    options.executablePath = executablePath;
+    if (sendFeedback) await sendFeedback(`Using browser: ${executablePath}`);
+  }
+  return chromium.launch(options);
+}
+
 async function scrapeSite(url, maxDepth = 1, sendFeedback) {
   if (sendFeedback) await sendFeedback(`Scraping ${url}...`);
-  const browser = await chromium.launch({ headless: true });
   const seen = new Set();
   const pages = [];
+  let mode = 'playwright';
+
   try {
-    await scrapePage(browser, url, Number(maxDepth) || 1, seen, pages, sendFeedback);
+    const browser = await launchBrowser(sendFeedback);
+    try {
+      await scrapePage(browser, url, Number(maxDepth) || 1, seen, pages, sendFeedback);
+    } finally {
+      await browser.close();
+    }
+  } catch (error) {
+    mode = 'http-fallback';
+    if (sendFeedback) await sendFeedback(`Browser scrape failed (${error.message.slice(0, 180)}). Trying HTTP fallback...`);
+    const text = await fetchUrl(url, sendFeedback);
+    pages.push({ url, title: '', text, links: [] });
+  }
+
+  const savedPath = await saveScrapeResult(url, pages, mode);
+  const consoleOutput = await execTool(`node -e "const fs=require('fs');const data=JSON.parse(fs.readFileSync('${savedPath.replace(/'/g, "'\\''")}','utf8'));console.log('Scrape validation OK. Pages:', data.pages.length); console.log('Mode:', data.mode);"`, sendFeedback);
+  if (sendFeedback) await sendFeedback(`Scrape complete. Pages: ${pages.length}. Saved: ${savedPath}`);
+  return { mode, savedPath, consoleOutput, pages };
+}
+
+async function saveScrapeResult(url, pages, mode) {
+  const dir = path.join(os.tmpdir(), 'git-push-bot-scrapes');
+  await fsp.mkdir(dir, { recursive: true });
+  const hostname = new URL(url).hostname.replace(/[^a-z0-9.-]/gi, '_');
+  const savedPath = path.join(dir, `${hostname}-${Date.now()}.json`);
+  await fsp.writeFile(savedPath, JSON.stringify({ url, mode, pages }, null, 2));
+  return savedPath;
+}
+
+async function screenshot(url, outputPath, fullPage = true, sendFeedback) {
+  const safeName = `${new URL(url).hostname.replace(/[^a-z0-9.-]/gi, '_')}-${Date.now()}.png`;
+  const resolvedPath = path.resolve(outputPath || path.join(os.tmpdir(), safeName));
+  await fsp.mkdir(path.dirname(resolvedPath), { recursive: true });
+  if (sendFeedback) await sendFeedback(`Taking screenshot of ${url}...`);
+
+  const browser = await launchBrowser(sendFeedback);
+  try {
+    const page = await browser.newPage({ viewport: { width: 1365, height: 768 } });
+    const consoleLines = [];
+    page.on('console', (message) => consoleLines.push(`${message.type()}: ${message.text()}`));
+    await page.goto(url, { waitUntil: 'networkidle', timeout: 90000 });
+    await page.screenshot({ path: resolvedPath, fullPage: Boolean(fullPage) });
+    if (sendFeedback) await sendFeedback(`Screenshot saved: ${resolvedPath}`);
+    return { path: resolvedPath, consoleOutput: consoleLines.slice(-50).join('\n') || 'No browser console messages.' };
   } finally {
     await browser.close();
   }
-  if (sendFeedback) await sendFeedback(`Scrape complete. Pages: ${pages.length}`);
-  return pages;
 }
 
 async function scrapePage(browser, url, depth, seen, pages, sendFeedback) {
@@ -234,12 +371,14 @@ async function scrapePage(browser, url, depth, seen, pages, sendFeedback) {
   seen.add(url);
   if (sendFeedback) await sendFeedback(`Scraping page: ${url}`);
   const page = await browser.newPage();
+  const consoleLines = [];
+  page.on('console', (message) => consoleLines.push(`${message.type()}: ${message.text()}`));
   try {
     await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
     const title = await page.title();
     const text = (await page.locator('body').innerText({ timeout: 10000 }).catch(() => '')).replace(/\s+/g, ' ').trim();
     const links = await page.$$eval('a[href]', (anchors) => anchors.map((a) => a.href).filter(Boolean).slice(0, 50));
-    pages.push({ url, title, text: text.slice(0, 6000), links });
+    pages.push({ url, title, text: text.slice(0, 6000), links, consoleOutput: consoleLines.slice(-30).join('\n') });
     if (depth > 1) {
       const origin = new URL(url).origin;
       for (const link of links.filter((l) => l.startsWith(origin)).slice(0, 3)) {
@@ -281,5 +420,6 @@ module.exports = {
   webSearch,
   fetchUrl,
   scrapeSite,
+  screenshot,
   findAPIs
 };

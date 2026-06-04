@@ -1,6 +1,6 @@
 # Git-push-bot-
 
-Telegram bot for basic shell/file operations, zip workflows, simple Git helpers, and Gemini chat.
+Telegram bot for shell/file operations, zip workflows, simple Git helpers, and a three-model AI chain (Groq -> Claude Pro -> Gemini).
 
 ## Fix for Pterodactyl crash (`Cannot find module './index.js'`)
 
@@ -35,7 +35,13 @@ node index.js
 - `/play <song name>` - search and play a song using the configured play API.
 - `/workspace` - list files in your workspace.
 - `/getfile <relative-path>` - download a workspace file.
+- Plain chat messages use the autonomous AI agent. It remembers per-user chat history, can scrape pages, take screenshots, install missing tools/modules with browser-download guards, run generated code, report console output, and upload multi-file results to gofile.io.
 - Upload a `.zip` document to save it into your workspace, immediately list saved zip files, and automatically start the GitHub URL/token push flow.
+
+
+## Browser and disk-space behavior
+
+The Docker image installs Alpine Chromium through `apk` and sets Playwright/Puppeteer skip-download environment variables. This prevents `npm install` from downloading large browser archives into the app disk, which avoids common `ENOSPC: no space left on device` failures while still allowing scrape and screenshot tools to use the system Chromium.
 
 ## Environment variables
 
@@ -45,4 +51,9 @@ Create a `.env` file with:
 BOT_TOKEN=your_telegram_bot_token
 ADMIN_ID=your_telegram_user_id
 GEMINIAPIKEY=your_gemini_api_key
+GEMINI_MODEL=gemini-1.5-flash
+GROQ_API_KEY=your_groq_api_key
+GROQ_MODEL=llama-3.3-70b-versatile
+# Optional: set BRAIN=gemini to start with Gemini instead of Groq. Default is groq.
+BRAIN=groq
 ```
