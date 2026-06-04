@@ -8,6 +8,9 @@ function buildHelpText(prefix = '/') {
     `${prefix}play <song name> - search and play a song`,
     `${prefix}workspace - list files/folders in your workspace`,
     `${prefix}getfile <relative-path> - download a file from workspace`,
+    `${prefix}model - show model switch buttons`,
+    `${prefix}gemini - switch AI chat to Gemini`,
+    `${prefix}groq - switch AI chat to Groq`,
     '',
     'Admin only:',
     `${prefix}users - list users`,
@@ -20,7 +23,7 @@ function buildHelpText(prefix = '/') {
     '- You can also reply to a .zip with /gitpush and the bot saves that replied zip before pushing.',
     '',
     'Limits:',
-    '- Every user can push up to 10 times per day.'
+    '- Admin has unlimited usage. Other users can use AI/run and push up to the configured daily limit.'
   ].join('\n');
 }
 
