@@ -30,7 +30,7 @@ node index.js
 ## Commands
 
 - `/help` - show bot help.
-- `/gitpush` - push the current workspace or latest uploaded zip to GitHub `main`. If you reply to a zip with `/gitpush`, the bot downloads that replied zip into your workspace, immediately lists saved zips, extracts the newest zip, asks for the GitHub repo URL, then asks for your token. The bot refuses empty commits, resets uploaded Git metadata, redacts committed GitHub Personal Access Tokens before committing to avoid push-protection blocks, reports ignored/untracked files, tries `--force-with-lease` if a normal main push is rejected, and falls back to opening a pull request when direct pushes still cannot update `main`.
+- `/gitpush` - push the current workspace or latest uploaded zip to GitHub `main`. If you reply to a zip with `/gitpush`, the bot downloads that replied zip into your workspace, immediately lists saved zips, extracts the newest zip, removes a single top-level wrapper folder such as `repo-main` so the project is pushed to the repository root, asks for the GitHub repo URL, then asks for your token. The bot refuses empty commits, resets uploaded Git metadata, redacts committed GitHub Personal Access Tokens before committing to avoid push-protection blocks, reports ignored/untracked files, tries `--force-with-lease` if a normal main push is rejected, and falls back to opening a pull request when direct pushes still cannot update `main`.
 - `/run <command>` - run a shell command in your workspace.
 - `/play <song name>` - search and play a song using the configured play API.
 - `/workspace` - list files in your workspace.
