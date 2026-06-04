@@ -19,18 +19,20 @@ const { appendLog, tailLogs } = require('./utils/logs');
 const { isZipFileName, listWorkspaceZips, saveTelegramZip } = require('./utils/fileHandler');
 
 
-const BRAIN = (process.env.BRAIN || 'groq').toLowerCase();
+const DEFAULT_BRAIN = (process.env.BRAIN || 'groq').toLowerCase();
 const GROQ_API_KEY = process.env.GROQ_API_KEY;
 const GROQ_MODEL = process.env.GROQ_MODEL || 'llama-3.3-70b-versatile';
 const ALLOWED_USER_ID = process.env.ALLOWED_USER_ID ? Number.parseInt(process.env.ALLOWED_USER_ID, 10) : null;
+const OWNER_ONLY = process.env.OWNER_ONLY === '1';
 
 const SYSTEM_PROMPT = `You are an autonomous CLI agent controlling a server. You can:
 - Run terminal commands with exec, including installing missing tools/modules when needed
 - Create full project worktrees with createWorkTree
 - Zip folders and upload to gofile.io with zipAndUpload
+- Send existing files directly to chat with sendFile
 - Browse web, scrape sites, find APIs
-- Take website screenshots with screenshot
-Always give feedback before/after actions. If user asks you to scrape, generate code, install dependencies, or build a project, you must run the code/command and report the console output. If a command fails, diagnose it, install missing dependencies/tools if safe, retry with another approach, and only stop after every reasonable method fails. If output is a single short script, you may paste it in chat; if there are many files, zipAndUpload the folder to gofile.io. Remember and use the saved chat history, user profile, and memories provided in the prompt.`;
+- Take full-page website screenshots with screenshot and send the image to chat
+Always create missing output directories before redirecting command output into files. Always give feedback before/after actions. If user asks you to scrape, generate code, install dependencies, or build a project, you must run the code/command and report the console output. If a command fails, diagnose it, install missing dependencies/tools if safe, retry with another approach, and only stop after every reasonable method fails. If output is a single short script, you may paste it in chat; if the user asks to send/download a file in chat, call sendFile with the file path; if there are many files, zipAndUpload the folder to gofile.io. Remember and use the saved chat history, user profile, and memories provided in the prompt.`;
 
 if (!process.env.BOT_TOKEN) {
   throw new Error('Missing BOT_TOKEN in environment.');
@@ -56,8 +58,30 @@ bot.start(async (ctx) => {
 
 bot.command('help', async (ctx) => ctx.reply(buildHelpText('/')));
 bot.command('gitpush', async (ctx) => ctx.scene.enter('gitPush'));
+bot.command('model', async (ctx) => {
+  const selected = await accessControl.getModel(ctx.from.id, DEFAULT_BRAIN);
+  return ctx.reply(`Current AI model: ${selected}
+Choose a model or use /gemini or /groq.`, {
+    reply_markup: {
+      inline_keyboard: [[
+        { text: '✨ Gemini', callback_data: 'model:gemini' },
+        { text: '⚡ Groq', callback_data: 'model:groq' }
+      ]]
+    }
+  });
+});
+
+bot.command('gemini', async (ctx) => switchModel(ctx, 'gemini'));
+bot.command('groq', async (ctx) => switchModel(ctx, 'groq'));
+bot.action(/^model:(gemini|groq)$/, async (ctx) => {
+  await ctx.answerCbQuery().catch(() => {});
+  return switchModel(ctx, ctx.match[1]);
+});
+
 
 bot.command('run', async (ctx) => {
+  const access = await consumeUsageOrReply(ctx, 'run');
+  if (!access) return;
   const command = (ctx.message?.text || '').replace(/^\/run\s*/, '').trim();
   if (!command) return ctx.reply('Usage: /run <command>');
   return runTerminalCommand(ctx, command, workspace.getPath(ctx.from.id));
@@ -65,6 +89,8 @@ bot.command('run', async (ctx) => {
 
 
 bot.command('play', async (ctx) => {
+  const access = await consumeUsageOrReply(ctx, 'play');
+  if (!access) return;
   const query = (ctx.message?.text || '').replace(/^\/play\s*/, '').trim();
   if (!query) return ctx.reply('Usage: /play <song name>');
 
@@ -158,7 +184,7 @@ I will extract it now, then ask for the GitHub repo URL before asking for your t
 bot.command('users', async (ctx) => {
   if (!(await accessControl.isAdmin(ctx.from.id))) return ctx.reply('Admin only command.');
   const users = await accessControl.listUsers();
-  const lines = users.map((u) => `${u.id} | @${u.username || '-'} | banned=${u.banned} | pushes=${u.pushCount}/${accessControl.DAILY_LIMIT}`);
+  const lines = users.map((u) => `${u.id} | @${u.username || '-'} | banned=${u.banned} | usage=${u.usageCount || 0}/${accessControl.DAILY_LIMIT} | pushes=${u.pushCount}/${accessControl.DAILY_LIMIT} | model=${u.selectedModel || 'default'}`);
   return ctx.reply(lines.length ? lines.join('\n') : 'No users yet.');
 });
 
@@ -185,7 +211,10 @@ async function adminUserAction(ctx, action) {
 bot.on('text', async (ctx) => {
   const userText = (ctx.message?.text || '').trim();
   if (userText.length < 2 || userText.startsWith('/')) return;
-  if (ALLOWED_USER_ID && ctx.from.id !== ALLOWED_USER_ID) return ctx.reply('Unauthorized');
+  if (OWNER_ONLY && ALLOWED_USER_ID && ctx.from.id !== ALLOWED_USER_ID) return ctx.reply('Unauthorized');
+
+  const access = await consumeUsageOrReply(ctx, 'ai');
+  if (!access) return;
 
   const userId = ctx.from.id;
 
@@ -221,6 +250,7 @@ async function executeToolCall(name, args, sendFeedback) {
   switch (name) {
     case 'exec': return agentTools.execTool(args.command, sendFeedback);
     case 'zipAndUpload': return agentTools.zipAndUpload(args.path, sendFeedback);
+    case 'sendFile': return agentTools.sendFile(args.path, sendFeedback);
     case 'createWorkTree': return agentTools.createWorkTree(args.rootDir, args.files, sendFeedback);
     case 'webSearch': return agentTools.webSearch(args.query, sendFeedback);
     case 'fetchUrl': return agentTools.fetchUrl(args.url, sendFeedback);
@@ -232,7 +262,7 @@ async function executeToolCall(name, args, sendFeedback) {
 }
 
 function shouldDeliverToolResult(toolName, result) {
-  return ['screenshot', 'scrapeSite', 'zipAndUpload'].includes(toolName) || Boolean(result?.path || result?.savedPath || result?.type === 'url');
+  return ['screenshot', 'scrapeSite', 'zipAndUpload', 'sendFile'].includes(toolName) || Boolean(result?.path || result?.savedPath || result?.type === 'url');
 }
 
 function buildMessages(userMsg, history, userId) {
@@ -269,7 +299,11 @@ async function deliverAgentResult(ctx, result) {
   if (result && typeof result === 'object') {
     if (result.type === 'url') return ctx.reply(`✅ Done. Download: ${result.url}`);
     if (result.path && await fs.pathExists(result.path)) {
+      const isImage = /^image\//i.test(result.mimetype || '') || /\.(png|jpe?g|webp)$/i.test(result.path);
       await ctx.reply(`✅ Done. File created: ${result.path}`);
+      if (isImage) {
+        return ctx.replyWithPhoto({ source: result.path }, { caption: result.caption || '🖼️ Screenshot' });
+      }
       return ctx.replyWithDocument({ source: result.path });
     }
     if (result.savedPath && await fs.pathExists(result.savedPath)) {
@@ -281,17 +315,80 @@ async function deliverAgentResult(ctx, result) {
   return ctx.reply(`✅ ${String(result || 'Done').slice(0, 3500)}`);
 }
 
+
+async function switchModel(ctx, model) {
+  if (!['gemini', 'groq'].includes(model)) return ctx.reply('Unknown model. Use /gemini or /groq.');
+  await accessControl.setModel(ctx.from.id, model);
+  await appendLog(ctx.from.id, 'model_switch', model);
+  return ctx.reply(`✅ Switched AI model to ${model}.`);
+}
+
+async function consumeUsageOrReply(ctx, action) {
+  const access = await accessControl.canUse(ctx.from.id);
+  if (!access.allowed) {
+    const reason = access.reason === 'banned'
+      ? '⛔ You are banned from using this bot.'
+      : `⛔ Daily usage limit reached (${accessControl.DAILY_LIMIT}/day). Ask the admin to reset you or try again tomorrow.`;
+    await ctx.reply(reason);
+    return false;
+  }
+  await accessControl.incrementUsage(ctx.from.id);
+  await appendLog(ctx.from.id, 'usage', `${action}:${access.remaining === Infinity ? 'admin' : access.remaining - 1}`);
+  return true;
+}
+
+function normalizeGroqMessages(messages) {
+  return (messages || [])
+    .filter((message) => ['system', 'user', 'assistant'].includes(message.role))
+    .map((message) => ({
+      role: message.role,
+      content: String(message.content || '').slice(0, message.role === 'system' ? 6000 : 12000)
+    }))
+    .filter((message) => message.content.trim())
+    .slice(-24);
+}
+
+async function runGroqJsonFallback(userMsg, history, sendFeedback, userId, depth, previousError) {
+  if (sendFeedback) await sendFeedback(`Retrying Groq without function-calling after API error: ${previousError}`);
+  const toolNames = agentTools.tools.map((t) => t.name).join(', ');
+  const messages = normalizeGroqMessages(buildMessages(
+    `Available tools: ${toolNames}. Return ONLY JSON. To call a tool return {"tool":"toolName","args":{...}}. To answer return {"final":"message"}. User/task: ${userMsg}`,
+    history,
+    userId
+  ));
+
+  const resp = await axios.post(
+    'https://api.groq.com/openai/v1/chat/completions',
+    { model: GROQ_MODEL, messages, temperature: 0.2 },
+    {
+      timeout: 120000,
+      headers: { Authorization: `Bearer ${GROQ_API_KEY}`, 'Content-Type': 'application/json' }
+    }
+  );
+  const raw = resp.data?.choices?.[0]?.message?.content || '';
+  const parsed = parseToolJson(raw);
+  if (!parsed) return raw || 'Done';
+  if (parsed.memory) historyManager.addMemory(userId, parsed.memory, 'groq');
+  if (parsed.tool) {
+    const result = await executeToolCall(parsed.tool, parsed.args || {}, sendFeedback);
+    if (shouldDeliverToolResult(parsed.tool, result)) return result;
+    return runAgent(`Tool result: ${JSON.stringify(result)}`, [...history, { role: 'user', content: userMsg }], sendFeedback, userId, depth + 1);
+  }
+  return parsed.final || raw;
+}
+
 async function runAgent(userMsg, history = [], sendFeedback, userId, depth = 0) {
   if (depth > 8) throw new Error('Tool recursion limit reached');
   const messages = buildMessages(userMsg, history, userId);
+  const selectedBrain = await accessControl.getModel(userId, DEFAULT_BRAIN);
 
-  if (BRAIN === 'groq' && GROQ_API_KEY) {
+  if (selectedBrain === 'groq' && GROQ_API_KEY) {
     try {
       const resp = await axios.post(
         'https://api.groq.com/openai/v1/chat/completions',
         {
           model: GROQ_MODEL,
-          messages,
+          messages: normalizeGroqMessages(messages),
           tools: agentTools.tools.map((t) => ({
             type: 'function',
             function: { name: t.name, description: t.description, parameters: t.parameters }
@@ -320,12 +417,21 @@ async function runAgent(userMsg, history = [], sendFeedback, userId, depth = 0) 
       return msg?.content || 'Done';
     } catch (error) {
       const status = error.response?.status;
-      if (sendFeedback) await sendFeedback(`Groq unavailable${status ? ` (${status})` : ''}; falling back to Claude Pro...`);
+      const details = error.response?.data?.error?.message || error.response?.data?.message || error.message;
+      if (status === 400) {
+        try {
+          return await runGroqJsonFallback(userMsg, history, sendFeedback, userId, depth, details);
+        } catch (retryError) {
+          if (sendFeedback) await sendFeedback(`Groq retry failed (${retryError.response?.status || retryError.message}); falling back to Claude Pro...`);
+        }
+      } else if (sendFeedback) {
+        await sendFeedback(`Groq unavailable${status ? ` (${status})` : ''}; falling back to Claude Pro...`);
+      }
       return runClaudeFallbackAgent(userMsg, history, sendFeedback, userId, depth);
     }
   }
 
-  if (BRAIN === 'gemini') return runGeminiFallbackAgent(userMsg, history, sendFeedback, userId, depth);
+  if (selectedBrain === 'gemini') return runGeminiFallbackAgent(userMsg, history, sendFeedback, userId, depth);
   return runClaudeFallbackAgent(userMsg, history, sendFeedback, userId, depth);
 }
 

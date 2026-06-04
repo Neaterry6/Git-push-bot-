@@ -8,7 +8,9 @@ const cheerio = require('cheerio');
 const { chromium } = require('playwright');
 const FormData = require('form-data');
 
-const GOFILE_API = 'https://api.gofile.io';
+const GOFILE_UPLOAD_API = 'https://upload.gofile.io/uploadfile';
+const GOFILE_TOKEN = process.env.GOFILE_TOKEN || process.env.GOFILE_ACCOUNT_TOKEN || '';
+const SCREENSHOTONE_ACCESS_KEY = process.env.SCREENSHOTONE_ACCESS_KEY || '';
 const MAX_EXEC_ATTEMPTS = 3;
 
 const tools = [
@@ -53,7 +55,7 @@ const tools = [
   },
   {
     name: 'screenshot',
-    description: 'Take a screenshot of a website with Playwright and return the saved image path. Args: {url: string, path?: string, fullPage?: boolean}',
+    description: 'Take a full-page website screenshot with ScreenshotOne when configured, falling back to Playwright, and return an image path to send in chat. Args: {url: string, path?: string, fullPage?: boolean}',
     parameters: {
       type: 'object',
       properties: {
@@ -75,7 +77,12 @@ const tools = [
   },
   {
     name: 'zipAndUpload',
-    description: 'Zip a folder/file. Upload to gofile.io and return direct download URL',
+    description: 'Zip a folder/file. Upload to gofile.io using the configured account token and return a public Gofile download page URL. Args: {path: string}',
+    parameters: { type: 'object', properties: { path: { type: 'string' } }, required: ['path'] }
+  },
+  {
+    name: 'sendFile',
+    description: 'Return an existing file path so the bot sends that file directly into chat. Use this whenever the user asks to send/download a file in chat. Args: {path: string}',
     parameters: { type: 'object', properties: { path: { type: 'string' } }, required: ['path'] }
   },
   {
@@ -142,6 +149,33 @@ async function cleanInstallCaches(sendFeedback) {
   }
 }
 
+
+function findRedirectTargets(command) {
+  const targets = [];
+  const redirectPattern = /(?:^|\s)(?:>|>>)(?!&)(?:\s*)(["']?)([^"'\s;&|<>]+)\1/g;
+  let match;
+  while ((match = redirectPattern.exec(String(command || '')))) {
+    const target = match[2];
+    if (target && !/^(?:\/dev\/|&\d+$)/.test(target)) targets.push(target);
+  }
+  return targets;
+}
+
+async function ensureRedirectDirectories(command, sendFeedback) {
+  const targets = findRedirectTargets(command);
+  for (const target of targets) {
+    const dir = path.dirname(path.resolve(target));
+    if (dir && dir !== process.cwd()) {
+      await fsp.mkdir(dir, { recursive: true });
+      if (sendFeedback) await sendFeedback(`Ensured output directory exists: ${dir}`);
+    }
+  }
+}
+
+function looksLikeMissingRedirectDirectory(output) {
+  return /cannot create .*Directory nonexistent|No such file or directory/i.test(output || '');
+}
+
 async function execTool(command, sendFeedback) {
   const blocked = ['rm -rf /', 'dd ', 'mkfs', ':(){'];
   if (blocked.some((b) => command.includes(b))) throw new Error('Blocked command');
@@ -152,6 +186,9 @@ async function execTool(command, sendFeedback) {
   let lastOutput = '';
   for (let attempt = 1; attempt <= MAX_EXEC_ATTEMPTS; attempt += 1) {
     const guardedCommand = isInstallCommand(baseCommand) ? appendInstallGuards(baseCommand) : baseCommand;
+    if (attempt > 1 && looksLikeMissingRedirectDirectory(lastOutput)) {
+      await ensureRedirectDirectories(baseCommand, sendFeedback);
+    }
     if (sendFeedback) await sendFeedback(`Running${attempt > 1 ? ` retry ${attempt}/${MAX_EXEC_ATTEMPTS}` : ''}: ${guardedCommand}`);
 
     try {
@@ -161,6 +198,11 @@ async function execTool(command, sendFeedback) {
     } catch (error) {
       lastOutput = error.message || String(error);
       if (sendFeedback) await sendFeedback(`Command failed. Console output:\n${lastOutput.slice(0, 900)}`);
+
+      if (attempt < MAX_EXEC_ATTEMPTS && looksLikeMissingRedirectDirectory(lastOutput)) {
+        await ensureRedirectDirectories(baseCommand, sendFeedback);
+        continue;
+      }
 
       if (attempt < MAX_EXEC_ATTEMPTS && (looksLikeDiskFailure(lastOutput) || isInstallCommand(baseCommand))) {
         await cleanInstallCaches(sendFeedback);
@@ -212,29 +254,53 @@ async function zipAndUpload(targetPath, sendFeedback) {
     archive.finalize();
   });
 
-  if (sendFeedback) await sendFeedback('Uploading to gofile.io...');
+  try {
+    return await uploadFileToGofile(zipPath, sendFeedback);
+  } finally {
+    await fsp.unlink(zipPath).catch(() => {});
+  }
+}
 
-  const serverRes = await axios.get(`${GOFILE_API}/servers`, { timeout: 60000 });
-  const servers = serverRes.data?.data?.servers || serverRes.data?.servers || [];
-  const server = servers[0]?.name;
-  if (!server) throw new Error('No gofile.io upload server available');
+async function uploadFileToGofile(filePath, sendFeedback) {
+  if (sendFeedback) await sendFeedback('Uploading to gofile.io account...');
 
   const form = new FormData();
-  form.append('file', fs.createReadStream(zipPath), { filename: path.basename(zipPath) });
+  form.append('file', fs.createReadStream(filePath), { filename: path.basename(filePath) });
 
-  const uploadRes = await axios.post(`https://${server}.gofile.io/uploadFile`, form, {
-    headers: form.getHeaders(),
+  const headers = { ...form.getHeaders() };
+  if (GOFILE_TOKEN) headers.Authorization = `Bearer ${GOFILE_TOKEN}`;
+
+  const uploadRes = await axios.post(GOFILE_UPLOAD_API, form, {
+    headers,
     maxBodyLength: Infinity,
-    timeout: 120000
+    timeout: 180000,
+    validateStatus: () => true
   });
 
-  await fsp.unlink(zipPath).catch(() => {});
+  if (uploadRes.status >= 400 || uploadRes.data?.status === 'error') {
+    throw new Error(`gofile.io upload failed (${uploadRes.status}): ${JSON.stringify(uploadRes.data).slice(0, 500)}`);
+  }
 
-  const downloadUrl = uploadRes.data?.data?.downloadPage || uploadRes.data?.downloadPage;
+  const data = uploadRes.data?.data || uploadRes.data || {};
+  const downloadUrl = data.downloadPage || data.downloadUrl || data.link || (data.code ? `https://gofile.io/d/${data.code}` : '');
   if (!downloadUrl) throw new Error(`gofile.io upload did not return a download URL: ${JSON.stringify(uploadRes.data).slice(0, 500)}`);
-  if (sendFeedback) await sendFeedback(`Uploaded. Link: ${downloadUrl}`);
 
-  return { type: 'url', url: downloadUrl };
+  if (sendFeedback) await sendFeedback(`Uploaded. Link: ${downloadUrl}`);
+  return {
+    type: 'url',
+    url: downloadUrl,
+    fileId: data.fileId || '',
+    folderId: data.parentFolder || data.folderId || '',
+    accountUpload: Boolean(GOFILE_TOKEN)
+  };
+}
+
+async function sendFile(filePath, sendFeedback) {
+  const resolvedPath = path.resolve(filePath);
+  const stats = await fsp.stat(resolvedPath);
+  if (!stats.isFile()) throw new Error(`Not a file: ${filePath}`);
+  if (sendFeedback) await sendFeedback(`Preparing file for chat: ${resolvedPath}`);
+  return { path: resolvedPath };
 }
 
 async function createWorkTree(rootDir, files, sendFeedback) {
@@ -347,23 +413,68 @@ async function saveScrapeResult(url, pages, mode) {
 }
 
 async function screenshot(url, outputPath, fullPage = true, sendFeedback) {
-  const safeName = `${new URL(url).hostname.replace(/[^a-z0-9.-]/gi, '_')}-${Date.now()}.png`;
+  const normalizedUrl = normalizeUrl(url);
+  const safeName = `${new URL(normalizedUrl).hostname.replace(/[^a-z0-9.-]/gi, '_')}-${Date.now()}.jpg`;
   const resolvedPath = path.resolve(outputPath || path.join(os.tmpdir(), safeName));
   await fsp.mkdir(path.dirname(resolvedPath), { recursive: true });
-  if (sendFeedback) await sendFeedback(`Taking screenshot of ${url}...`);
 
+  if (SCREENSHOTONE_ACCESS_KEY) {
+    try {
+      if (sendFeedback) await sendFeedback(`Taking full-page ScreenshotOne capture of ${normalizedUrl}...`);
+      const response = await axios.get('https://api.screenshotone.com/take', {
+        params: {
+          access_key: SCREENSHOTONE_ACCESS_KEY,
+          url: normalizedUrl,
+          format: 'jpg',
+          full_page: Boolean(fullPage),
+          block_ads: true,
+          block_cookie_banners: true,
+          block_trackers: true,
+          image_quality: 80,
+          response_type: 'by_format'
+        },
+        responseType: 'arraybuffer',
+        timeout: 60000,
+        validateStatus: () => true
+      });
+
+      if (response.status >= 400) {
+        throw new Error(`ScreenshotOne returned HTTP ${response.status}`);
+      }
+
+      await fsp.writeFile(resolvedPath, Buffer.from(response.data));
+      if (sendFeedback) await sendFeedback(`Screenshot saved: ${resolvedPath}`);
+      return { path: resolvedPath, mimetype: 'image/jpeg', caption: `🖼️ Full-page screenshot of:\n${normalizedUrl}` };
+    } catch (error) {
+      if (sendFeedback) await sendFeedback(`ScreenshotOne failed (${error.message.slice(0, 180)}). Trying local browser fallback...`);
+    }
+  }
+
+  const pngPath = resolvedPath.replace(/\.jpe?g$/i, '.png');
+  if (sendFeedback) await sendFeedback(`Taking local browser screenshot of ${normalizedUrl}...`);
   const browser = await launchBrowser(sendFeedback);
   try {
     const page = await browser.newPage({ viewport: { width: 1365, height: 768 } });
     const consoleLines = [];
     page.on('console', (message) => consoleLines.push(`${message.type()}: ${message.text()}`));
-    await page.goto(url, { waitUntil: 'networkidle', timeout: 90000 });
-    await page.screenshot({ path: resolvedPath, fullPage: Boolean(fullPage) });
-    if (sendFeedback) await sendFeedback(`Screenshot saved: ${resolvedPath}`);
-    return { path: resolvedPath, consoleOutput: consoleLines.slice(-50).join('\n') || 'No browser console messages.' };
+    await page.goto(normalizedUrl, { waitUntil: 'networkidle', timeout: 90000 });
+    await page.screenshot({ path: pngPath, fullPage: Boolean(fullPage) });
+    if (sendFeedback) await sendFeedback(`Screenshot saved: ${pngPath}`);
+    return {
+      path: pngPath,
+      mimetype: 'image/png',
+      caption: `🖼️ Screenshot of:\n${normalizedUrl}`,
+      consoleOutput: consoleLines.slice(-50).join('\n') || 'No browser console messages.'
+    };
   } finally {
     await browser.close();
   }
+}
+
+function normalizeUrl(url) {
+  const trimmed = String(url || '').trim();
+  if (!trimmed) throw new Error('URL is required');
+  return /^https?:\/\//i.test(trimmed) ? trimmed : `https://${trimmed}`;
 }
 
 async function scrapePage(browser, url, depth, seen, pages, sendFeedback) {
@@ -416,6 +527,7 @@ module.exports = {
   tools,
   execTool,
   zipAndUpload,
+  sendFile,
   createWorkTree,
   webSearch,
   fetchUrl,

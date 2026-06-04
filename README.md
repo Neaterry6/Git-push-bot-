@@ -35,6 +35,8 @@ node index.js
 - `/play <song name>` - search and play a song using the configured play API.
 - `/workspace` - list files in your workspace.
 - `/getfile <relative-path>` - download a workspace file.
+- `/model` - show Gemini/Groq switch buttons.
+- `/gemini` and `/groq` - prefix commands for switching the AI provider.
 - Plain chat messages use the autonomous AI agent. It remembers per-user chat history, can scrape pages, take screenshots, install missing tools/modules with browser-download guards, run generated code, report console output, and upload multi-file results to gofile.io.
 - Upload a `.zip` document to save it into your workspace, immediately list saved zip files, and automatically start the GitHub URL/token push flow.
 
@@ -54,6 +56,9 @@ GEMINIAPIKEY=your_gemini_api_key
 GEMINI_MODEL=gemini-1.5-flash
 GROQ_API_KEY=your_groq_api_key
 GROQ_MODEL=llama-3.3-70b-versatile
+GOFILE_TOKEN=your_gofile_account_token
+SCREENSHOTONE_ACCESS_KEY=your_screenshotone_access_key
+DAILY_LIMIT=10
 # Optional: set BRAIN=gemini to start with Gemini instead of Groq. Default is groq.
 BRAIN=groq
 ```
