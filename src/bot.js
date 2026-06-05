@@ -16,7 +16,9 @@ const gitPushScene = require('./scenes/gitPush');
 const { buildHelpText } = require('./commands/help');
 const accessControl = require('./utils/accessControl');
 const { appendLog, tailLogs } = require('./utils/logs');
-const { isZipFileName, listWorkspaceZips, saveTelegramZip } = require('./utils/fileHandler');
+const { requestWithRetry } = require('./utils/httpRetry');
+const consoleCapture = require('./utils/consoleCapture');
+const { isZipFileName, listWorkspaceZips, saveTelegramZip, unzipFile } = require('./utils/fileHandler');
 
 
 const DEFAULT_BRAIN = (process.env.BRAIN || 'groq').toLowerCase();
@@ -24,6 +26,7 @@ const GROQ_API_KEY = process.env.GROQ_API_KEY;
 const GROQ_MODEL = process.env.GROQ_MODEL || 'llama-3.3-70b-versatile';
 const ALLOWED_USER_ID = process.env.ALLOWED_USER_ID ? Number.parseInt(process.env.ALLOWED_USER_ID, 10) : null;
 const OWNER_ONLY = process.env.OWNER_ONLY === '1';
+const creationSessions = new Map();
 
 const SYSTEM_PROMPT = `You are an autonomous CLI agent controlling a server. You can:
 - Run terminal commands with exec, including installing missing tools/modules when needed
@@ -32,7 +35,11 @@ const SYSTEM_PROMPT = `You are an autonomous CLI agent controlling a server. You
 - Send existing files directly to chat with sendFile
 - Browse web, scrape sites, find APIs
 - Take full-page website screenshots with screenshot and send the image to chat
-Always create missing output directories before redirecting command output into files. Always give feedback before/after actions. If user asks you to scrape, generate code, install dependencies, or build a project, you must run the code/command and report the console output. If a command fails, diagnose it, install missing dependencies/tools if safe, retry with another approach, and only stop after every reasonable method fails. If output is a single short script, you may paste it in chat; if the user asks to send/download a file in chat, call sendFile with the file path; if there are many files, zipAndUpload the folder to gofile.io. Remember and use the saved chat history, user profile, and memories provided in the prompt.`;
+- Send a screenshot of this bot's own console/output transcript with consoleScreenshot
+- Extract zip files with unzipFile without asking for GitHub details
+When the user asks you to create, build, scaffold, generate, or code a project/app/site/bot, first draft a clean work tree with sensible folders, then write complete code/config files for every needed directory using createWorkTree. Do not leave empty placeholder directories. After creating it, the bot will ask whether the user wants updates before packaging.
+Only push to GitHub when the user explicitly runs /gitpush or clearly asks to push/upload to GitHub. If the user only asks to unzip, extract, inspect, edit, build, or send files, do not ask for a GitHub repo URL/token and do not run git push.
+Always create missing output directories before redirecting command output into files. Always give feedback before/after actions. If user asks you to scrape, generate code, install dependencies, or build a project, you must run the code/command and report the console output. If a command fails, diagnose it, install missing dependencies/tools if safe, retry with another approach, and only stop after every reasonable method fails. If output is a single short script, you may paste it in chat; if the user asks to send/download a file in chat, call sendFile with the file path; if there are many files, create them as a worktree and let the bot package them after user approval. Remember and use the saved chat history, user profile, and memories provided in the prompt.`;
 
 if (!process.env.BOT_TOKEN) {
   throw new Error('Missing BOT_TOKEN in environment.');
@@ -98,13 +105,18 @@ bot.command('play', async (ctx) => {
   await ctx.reply(`🎵 Searching for: ${query}`);
 
   try {
-    const { data } = await axios.get('https://apis.davidcyril.name.ng/play', {
+    const { data } = await requestWithRetry(axios, {
+      method: 'get',
+      url: 'https://apis.davidcyril.name.ng/play',
       params: { query },
       timeout: 60000,
       headers: {
         Accept: 'application/json',
         'User-Agent': 'TelegramBot/1.0'
       }
+    }, {
+      retries: 2,
+      onRetry: async (error, attempt, delayMs) => appendLog(ctx.from.id, 'play_retry', `${error.response?.status || error.code || error.message}; attempt=${attempt}; delay=${delayMs}`)
     });
 
     const song = extractPlayableSong(data);
@@ -165,16 +177,28 @@ bot.on('document', async (ctx) => {
     await appendLog(userId, 'zip_saved', savedZip.name);
     const zipListing = await listWorkspaceZips(cwd);
 
-    await ctx.reply(`✅ Saved zip: ${savedZip.name}
+    const extractedDir = path.join(cwd, 'extracted');
+    const unzipResult = await unzipFile(savedZip.fullPath, extractedDir);
+    const { output: listing } = await terminal.run(userId, 'find extracted -maxdepth 2 -type f | sort | head -80', cwd);
+    const strippedNote = unzipResult.strippedRoot ? `
+📂 Removed zip wrapper folder: ${unzipResult.strippedRoot}` : '';
+
+    await ctx.reply(`✅ Saved and extracted zip: ${savedZip.name}${strippedNote}
 
 📦 Workspace zip files (ls):
 
 \`\`\`
-${zipListing.slice(0, 3200)}
+${zipListing.slice(0, 1800)}
 \`\`\`
 
-I will extract it now, then ask for the GitHub repo URL before asking for your token.`);
-    return ctx.scene.enter('gitPush', { zipAlreadySaved: true });
+📂 Extracted files:
+
+\`\`\`
+${listing.slice(0, 2200)}
+\`\`\`
+
+I did not start a GitHub push. I will only ask for a GitHub repo URL/token if you explicitly run /gitpush or ask me to push to GitHub.`);
+    return;
   } catch (error) {
     await appendLog(userId, 'zip_save_failed', error.message);
     return ctx.reply(`❌ Failed to save zip: ${error.message}`);
@@ -213,6 +237,10 @@ bot.on('text', async (ctx) => {
   if (userText.length < 2 || userText.startsWith('/')) return;
   if (OWNER_ONLY && ALLOWED_USER_ID && ctx.from.id !== ALLOWED_USER_ID) return ctx.reply('Unauthorized');
 
+  if (creationSessions.has(ctx.from.id)) {
+    return handleCreationFollowup(ctx, userText);
+  }
+
   const access = await consumeUsageOrReply(ctx, 'ai');
   if (!access) return;
 
@@ -231,6 +259,7 @@ bot.on('text', async (ctx) => {
   await ctx.sendChatAction('typing');
 
   const sendFeedback = async (msg) => {
+    consoleCapture.append(userId, msg);
     await ctx.reply(`⏳ ${String(msg).slice(0, 3500)}`);
   };
 
@@ -239,19 +268,26 @@ bot.on('text', async (ctx) => {
 
     await deliverAgentResult(ctx, result);
     historyManager.addMessage(userId, 'assistant', typeof result === 'string' ? result : JSON.stringify(result).slice(0, 8000));
+    await promptForCreationUpdates(ctx);
   } catch (error) {
     await appendLog(userId, 'agent_error', error.message);
     await ctx.reply(`❌ Error: ${error.message}`);
   }
 });
 
-async function executeToolCall(name, args, sendFeedback) {
+async function executeToolCall(name, args, sendFeedback, userId) {
   if (sendFeedback) await sendFeedback(`Calling tool: ${name}`);
   switch (name) {
     case 'exec': return agentTools.execTool(args.command, sendFeedback);
     case 'zipAndUpload': return agentTools.zipAndUpload(args.path, sendFeedback);
     case 'sendFile': return agentTools.sendFile(args.path, sendFeedback);
-    case 'createWorkTree': return agentTools.createWorkTree(args.rootDir, args.files, sendFeedback);
+    case 'createWorkTree': {
+      const result = await agentTools.createWorkTree(args.rootDir, args.files, sendFeedback);
+      creationSessions.set(userId, { ...result, stage: 'await_update', createdAt: Date.now() });
+      return result;
+    }
+    case 'unzipFile': return agentTools.unzipFileTool(args.zipPath, args.destination, sendFeedback);
+    case 'consoleScreenshot': return consoleCapture.saveScreenshot(userId, args.path);
     case 'webSearch': return agentTools.webSearch(args.query, sendFeedback);
     case 'fetchUrl': return agentTools.fetchUrl(args.url, sendFeedback);
     case 'scrapeSite': return agentTools.scrapeSite(args.url, args.maxDepth, sendFeedback);
@@ -262,7 +298,7 @@ async function executeToolCall(name, args, sendFeedback) {
 }
 
 function shouldDeliverToolResult(toolName, result) {
-  return ['screenshot', 'scrapeSite', 'zipAndUpload', 'sendFile'].includes(toolName) || Boolean(result?.path || result?.savedPath || result?.type === 'url');
+  return ['screenshot', 'consoleScreenshot', 'scrapeSite', 'zipAndUpload', 'sendFile', 'unzipFile', 'createWorkTree'].includes(toolName) || Boolean(result?.path || result?.savedPath || result?.type === 'url');
 }
 
 function buildMessages(userMsg, history, userId) {
@@ -299,7 +335,7 @@ async function deliverAgentResult(ctx, result) {
   if (result && typeof result === 'object') {
     if (result.type === 'url') return ctx.reply(`✅ Done. Download: ${result.url}`);
     if (result.path && await fs.pathExists(result.path)) {
-      const isImage = /^image\//i.test(result.mimetype || '') || /\.(png|jpe?g|webp)$/i.test(result.path);
+      const isImage = (/^image\//i.test(result.mimetype || '') || /\.(png|jpe?g|webp)$/i.test(result.path)) && !/svg\+xml/i.test(result.mimetype || '') && !/\.svg$/i.test(result.path);
       await ctx.reply(`✅ Done. File created: ${result.path}`);
       if (isImage) {
         return ctx.replyWithPhoto({ source: result.path }, { caption: result.caption || '🖼️ Screenshot' });
@@ -315,6 +351,115 @@ async function deliverAgentResult(ctx, result) {
   return ctx.reply(`✅ ${String(result || 'Done').slice(0, 3500)}`);
 }
 
+
+
+function isYes(text) {
+  return /^(yes|yeah|yep|sure|ok|okay|add|update|change|edit|y)\b/i.test(String(text || '').trim());
+}
+
+function isNoOrPackage(text) {
+  return /^(no|nah|nope|done|finish|finished|zip|package|upload|send|ship|n)\b/i.test(String(text || '').trim());
+}
+
+function wantsChatZip(text) {
+  const value = String(text || '').toLowerCase();
+  return /send.*(zip|file|chat)|chat.*(zip|file)|direct.*(zip|file)|telegram/.test(value) && !/gofile|link|upload/.test(value);
+}
+
+async function promptForCreationUpdates(ctx) {
+  const pending = creationSessions.get(ctx.from.id);
+  if (!pending || pending.stage !== 'await_update') return;
+
+  const files = (pending.files || []).slice(0, 40).join('\n');
+  await ctx.reply(`✅ Project worktree is ready at:\n${pending.rootDir}\n\nFiles created (${pending.fileCount || pending.files?.length || 0}):\n\n\`\`\`\n${files.slice(0, 2200)}\n\`\`\`\n\nDo you want any updates before I package it? Reply **yes** to add/change something, or **no** to zip it and upload to Gofile. You can also say "send zip to chat".`);
+}
+
+async function finalizeCreation(ctx, pending, options = {}) {
+  const userId = ctx.from.id;
+  const sendFeedback = async (msg) => {
+    consoleCapture.append(userId, msg);
+    await ctx.reply(`⏳ ${String(msg).slice(0, 3500)}`);
+  };
+
+  creationSessions.delete(userId);
+
+  if (options.directZip) {
+    const zipResult = await agentTools.createZipArchive(pending.rootDir, null, sendFeedback);
+    try {
+      await ctx.reply(`✅ Zip ready. Sending it here in chat instead of uploading to Gofile.`);
+      return ctx.replyWithDocument({ source: zipResult.path }, { caption: zipResult.caption || '📦 Project zip' });
+    } finally {
+      await fs.unlink(zipResult.path).catch(() => {});
+    }
+  }
+
+  try {
+    const upload = await agentTools.zipAndUpload(pending.rootDir, sendFeedback);
+    return ctx.reply(`✅ Project zipped and uploaded to Gofile:\n${upload.url}`);
+  } catch (error) {
+    await ctx.reply(`⚠️ Gofile upload failed (${error.message.slice(0, 500)}). I will send the zip directly in chat instead.`);
+    const zipResult = await agentTools.createZipArchive(pending.rootDir, null, sendFeedback);
+    try {
+      return ctx.replyWithDocument({ source: zipResult.path }, { caption: zipResult.caption || '📦 Project zip' });
+    } finally {
+      await fs.unlink(zipResult.path).catch(() => {});
+    }
+  }
+}
+
+async function handleCreationFollowup(ctx, userText) {
+  const userId = ctx.from.id;
+  const pending = creationSessions.get(userId);
+  if (!pending) return false;
+
+  if (pending.stage === 'await_update') {
+    if (isYes(userText)) {
+      pending.stage = 'await_details';
+      creationSessions.set(userId, pending);
+      return ctx.reply('Cool — what do you want added or changed in the project?');
+    }
+
+    if (isNoOrPackage(userText)) {
+      return finalizeCreation(ctx, pending, { directZip: wantsChatZip(userText) });
+    }
+
+    return ctx.reply('Please reply **yes** if you want updates, or **no** to zip and upload it. You can also say "send zip to chat".');
+  }
+
+  if (pending.stage === 'await_details') {
+    if (/^(cancel|nevermind|never mind|no|done)$/i.test(userText.trim())) {
+      return finalizeCreation(ctx, pending);
+    }
+
+    const access = await consumeUsageOrReply(ctx, 'ai-update');
+    if (!access) return;
+
+    await appendLog(userId, 'creation_update', userText);
+    historyManager.addMessage(userId, 'user', userText);
+    const sendFeedback = async (msg) => {
+      consoleCapture.append(userId, msg);
+      await ctx.reply(`⏳ ${String(msg).slice(0, 3500)}`);
+    };
+
+    const result = await runAgent(
+      `Update the existing project at ${pending.rootDir}. Keep the current structure, add or modify complete files as needed, and do not push to GitHub. User requested: ${userText}`,
+      [],
+      sendFeedback,
+      userId
+    );
+
+    await deliverAgentResult(ctx, result);
+    historyManager.addMessage(userId, 'assistant', typeof result === 'string' ? result : JSON.stringify(result).slice(0, 8000));
+
+    const updated = creationSessions.get(userId) || pending;
+    updated.stage = 'await_update';
+    creationSessions.set(userId, updated);
+    return promptForCreationUpdates(ctx);
+  }
+
+  creationSessions.delete(userId);
+  return false;
+}
 
 async function switchModel(ctx, model) {
   if (!['gemini', 'groq'].includes(model)) return ctx.reply('Unknown model. Use /gemini or /groq.');
@@ -357,20 +502,24 @@ async function runGroqJsonFallback(userMsg, history, sendFeedback, userId, depth
     userId
   ));
 
-  const resp = await axios.post(
-    'https://api.groq.com/openai/v1/chat/completions',
-    { model: GROQ_MODEL, messages, temperature: 0.2 },
-    {
-      timeout: 120000,
-      headers: { Authorization: `Bearer ${GROQ_API_KEY}`, 'Content-Type': 'application/json' }
+  const resp = await requestWithRetry(axios, {
+    method: 'post',
+    url: 'https://api.groq.com/openai/v1/chat/completions',
+    data: { model: GROQ_MODEL, messages, temperature: 0.2 },
+    timeout: 120000,
+    headers: { Authorization: `Bearer ${GROQ_API_KEY}`, 'Content-Type': 'application/json' }
+  }, {
+    retries: 2,
+    onRetry: async (error, attempt, delayMs) => {
+      if (sendFeedback) await sendFeedback(`Groq rate-limit/temporary error (${error.response?.status || error.code || error.message}); retry ${attempt} in ${Math.round(delayMs / 1000)}s...`);
     }
-  );
+  });
   const raw = resp.data?.choices?.[0]?.message?.content || '';
   const parsed = parseToolJson(raw);
   if (!parsed) return raw || 'Done';
   if (parsed.memory) historyManager.addMemory(userId, parsed.memory, 'groq');
   if (parsed.tool) {
-    const result = await executeToolCall(parsed.tool, parsed.args || {}, sendFeedback);
+    const result = await executeToolCall(parsed.tool, parsed.args || {}, sendFeedback, userId);
     if (shouldDeliverToolResult(parsed.tool, result)) return result;
     return runAgent(`Tool result: ${JSON.stringify(result)}`, [...history, { role: 'user', content: userMsg }], sendFeedback, userId, depth + 1);
   }
@@ -384,9 +533,10 @@ async function runAgent(userMsg, history = [], sendFeedback, userId, depth = 0) 
 
   if (selectedBrain === 'groq' && GROQ_API_KEY) {
     try {
-      const resp = await axios.post(
-        'https://api.groq.com/openai/v1/chat/completions',
-        {
+      const resp = await requestWithRetry(axios, {
+        method: 'post',
+        url: 'https://api.groq.com/openai/v1/chat/completions',
+        data: {
           model: GROQ_MODEL,
           messages: normalizeGroqMessages(messages),
           tools: agentTools.tools.map((t) => ({
@@ -395,21 +545,24 @@ async function runAgent(userMsg, history = [], sendFeedback, userId, depth = 0) 
           })),
           tool_choice: 'auto'
         },
-        {
-          timeout: 120000,
-          headers: {
-            Authorization: `Bearer ${GROQ_API_KEY}`,
-            'Content-Type': 'application/json'
-          }
+        timeout: 120000,
+        headers: {
+          Authorization: `Bearer ${GROQ_API_KEY}`,
+          'Content-Type': 'application/json'
         }
-      );
+      }, {
+        retries: 2,
+        onRetry: async (error, attempt, delayMs) => {
+          if (sendFeedback) await sendFeedback(`Groq rate-limit/temporary error (${error.response?.status || error.code || error.message}); retry ${attempt} in ${Math.round(delayMs / 1000)}s...`);
+        }
+      });
 
       const msg = resp.data?.choices?.[0]?.message;
       if (msg?.tool_calls?.length) {
         let lastResult;
         for (const call of msg.tool_calls) {
           const parsedArgs = JSON.parse(call.function.arguments || '{}');
-          lastResult = await executeToolCall(call.function.name, parsedArgs, sendFeedback);
+          lastResult = await executeToolCall(call.function.name, parsedArgs, sendFeedback, userId);
           if (shouldDeliverToolResult(call.function.name, lastResult)) return lastResult;
         }
         return runAgent(`Tool result: ${JSON.stringify(lastResult)}`, [...history, { role: 'user', content: userMsg }], sendFeedback, userId, depth + 1);
@@ -459,7 +612,7 @@ User/task: ${userMsg}`;
 
   if (parsed.memory) historyManager.addMemory(userId, parsed.memory, 'claude');
   if (parsed.tool) {
-    const result = await executeToolCall(parsed.tool, parsed.args || {}, sendFeedback);
+    const result = await executeToolCall(parsed.tool, parsed.args || {}, sendFeedback, userId);
     if (shouldDeliverToolResult(parsed.tool, result)) return result;
     return runClaudeFallbackAgent(`Tool result: ${JSON.stringify(result)}`, [...history, { role: 'user', content: userMsg }], sendFeedback, userId, depth + 1);
   }
@@ -482,7 +635,7 @@ async function runGeminiFallbackAgent(userMsg, history = [], sendFeedback, userI
 
   if (parsed.memory) historyManager.addMemory(userId, parsed.memory, 'gemini');
   if (parsed.tool) {
-    const result = await executeToolCall(parsed.tool, parsed.args || {}, sendFeedback);
+    const result = await executeToolCall(parsed.tool, parsed.args || {}, sendFeedback, userId);
     if (shouldDeliverToolResult(parsed.tool, result)) return result;
     return runGeminiFallbackAgent(`Tool result: ${JSON.stringify(result)}`, [...history, { role: 'user', content: userMsg }], sendFeedback, userId, depth + 1);
   }
@@ -492,13 +645,16 @@ async function runGeminiFallbackAgent(userMsg, history = [], sendFeedback, userI
 
 async function runTerminalCommand(ctx, command, cwd) {
   await appendLog(ctx.from.id, 'terminal_run', command);
+  consoleCapture.append(ctx.from.id, `$ ${command}`);
   await ctx.reply(`🔄 Running: \`${command}\``);
   try {
     const { output, cwd: activeCwd } = await terminal.run(ctx.from.id, command, cwd);
+    consoleCapture.append(ctx.from.id, output);
     await appendLog(ctx.from.id, 'terminal_output', output.slice(0, 300));
     await ctx.reply(`✅ Output:\n\n\`\`\`\n${output.slice(0, 3500)}\n\`\`\``);
     await ctx.reply(`📁 CWD: ${activeCwd}`);
   } catch (error) {
+    consoleCapture.append(ctx.from.id, `ERROR: ${error.message}`);
     await appendLog(ctx.from.id, 'terminal_error', error.message);
     await ctx.reply(`❌ ${error.message}`);
   }

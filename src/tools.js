@@ -7,6 +7,7 @@ const axios = require('axios');
 const cheerio = require('cheerio');
 const { chromium } = require('playwright');
 const FormData = require('form-data');
+const { unzipFile: extractZipFile } = require('./utils/fileHandler');
 
 const GOFILE_UPLOAD_API = 'https://upload.gofile.io/uploadfile';
 const GOFILE_TOKEN = process.env.GOFILE_TOKEN || process.env.GOFILE_ACCOUNT_TOKEN || '';
@@ -16,7 +17,7 @@ const MAX_EXEC_ATTEMPTS = 3;
 const tools = [
   {
     name: 'exec',
-    description: 'Run a terminal command and return stdout/stderr. Automatically retries common install/disk/browser-download failures. Args: {command: string}',
+    description: 'Run a terminal command and return stdout/stderr. Automatically retries common install/disk/browser-download failures and may install missing task tools when safe. Args: {command: string}',
     parameters: {
       type: 'object',
       properties: { command: { type: 'string' } },
@@ -54,6 +55,23 @@ const tools = [
     }
   },
   {
+    name: 'consoleScreenshot',
+    description: 'Send a screenshot image of this bot chat console/output transcript. Use this when the user asks for a screenshot of your own console, terminal, running task, or bot output. Args: {path?: string}',
+    parameters: {
+      type: 'object',
+      properties: { path: { type: 'string' } }
+    }
+  },
+  {
+    name: 'unzipFile',
+    description: 'Extract a zip file into a workspace folder without pushing to GitHub. Use this for unzip/extract requests unless the user explicitly asks to push to GitHub. Args: {zipPath: string, destination?: string}',
+    parameters: {
+      type: 'object',
+      properties: { zipPath: { type: 'string' }, destination: { type: 'string' } },
+      required: ['zipPath']
+    }
+  },
+  {
     name: 'screenshot',
     description: 'Take a full-page website screenshot with ScreenshotOne when configured, falling back to Playwright, and return an image path to send in chat. Args: {url: string, path?: string, fullPage?: boolean}',
     parameters: {
@@ -87,7 +105,7 @@ const tools = [
   },
   {
     name: 'createWorkTree',
-    description: 'Create a full project structure with files and code. Args: {rootDir: string, files: [{path: string, content: string}]}',
+    description: 'Create a complete project worktree with a thoughtful folder/file structure and full code/config content for every needed directory. Args: {rootDir: string, files: [{path: string, content: string}]}',
     parameters: {
       type: 'object',
       properties: {
@@ -109,17 +127,22 @@ const tools = [
   }
 ];
 
-function getInstallSafeEnv() {
+function getInstallSafeEnv(command = '') {
   const cacheRoot = process.env.BOT_CACHE_DIR || path.join(os.tmpdir(), 'git-push-bot-cache');
-  return {
+  const env = {
     ...process.env,
-    PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: process.env.PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD || '1',
     PUPPETEER_SKIP_DOWNLOAD: process.env.PUPPETEER_SKIP_DOWNLOAD || '1',
     PUPPETEER_SKIP_CHROMIUM_DOWNLOAD: process.env.PUPPETEER_SKIP_CHROMIUM_DOWNLOAD || '1',
     npm_config_cache: process.env.npm_config_cache || path.join(cacheRoot, 'npm'),
     YARN_CACHE_FOLDER: process.env.YARN_CACHE_FOLDER || path.join(cacheRoot, 'yarn'),
     PNPM_HOME: process.env.PNPM_HOME || path.join(cacheRoot, 'pnpm')
   };
+
+  if (!/npx\s+playwright\s+install|playwright\s+install/i.test(command)) {
+    env.PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD = process.env.PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD || '1';
+  }
+
+  return env;
 }
 
 function isInstallCommand(command) {
@@ -145,7 +168,7 @@ async function cleanInstallCaches(sendFeedback) {
   ];
   for (const command of cleanupCommands) {
     if (sendFeedback) await sendFeedback(`Freeing disk space: ${command}`);
-    await execa(command, { shell: true, timeout: 120000, all: true, reject: false, env: getInstallSafeEnv() });
+    await execa(command, { shell: true, timeout: 120000, all: true, reject: false, env: getInstallSafeEnv(command) });
   }
 }
 
@@ -192,7 +215,7 @@ async function execTool(command, sendFeedback) {
     if (sendFeedback) await sendFeedback(`Running${attempt > 1 ? ` retry ${attempt}/${MAX_EXEC_ATTEMPTS}` : ''}: ${guardedCommand}`);
 
     try {
-      const output = await runCommand(guardedCommand, sendFeedback, getInstallSafeEnv());
+      const output = await runCommand(guardedCommand, sendFeedback, getInstallSafeEnv(guardedCommand));
       if (sendFeedback) await sendFeedback(`Done. Console output:\n${output.slice(0, 900)}`);
       return output;
     } catch (error) {
@@ -236,12 +259,14 @@ async function runCommand(command, sendFeedback, env) {
   return (output || result.all || result.stdout || result.stderr || 'Command executed').trim();
 }
 
-async function zipAndUpload(targetPath, sendFeedback) {
-  const zipPath = path.join(os.tmpdir(), `${Date.now()}.zip`);
+async function createZipArchive(targetPath, outputPath, sendFeedback) {
   const resolvedPath = path.resolve(targetPath);
   const stats = await fsp.stat(resolvedPath);
+  const defaultName = `${path.basename(resolvedPath).replace(/[^a-z0-9._-]/gi, '_') || 'archive'}-${Date.now()}.zip`;
+  const zipPath = path.resolve(outputPath || path.join(os.tmpdir(), defaultName));
 
-  if (sendFeedback) await sendFeedback(`Zipping ${targetPath}...`);
+  await fsp.mkdir(path.dirname(zipPath), { recursive: true });
+  if (sendFeedback) await sendFeedback(`Zipping ${resolvedPath} to ${zipPath}...`);
 
   await new Promise((resolve, reject) => {
     const output = fs.createWriteStream(zipPath);
@@ -254,10 +279,17 @@ async function zipAndUpload(targetPath, sendFeedback) {
     archive.finalize();
   });
 
+  if (sendFeedback) await sendFeedback(`Zip ready: ${zipPath}`);
+  return { path: zipPath, mimetype: 'application/zip', caption: `📦 Zip archive for ${path.basename(resolvedPath)}` };
+}
+
+async function zipAndUpload(targetPath, sendFeedback) {
+  const zipResult = await createZipArchive(targetPath, null, sendFeedback);
+
   try {
-    return await uploadFileToGofile(zipPath, sendFeedback);
+    return await uploadFileToGofile(zipResult.path, sendFeedback);
   } finally {
-    await fsp.unlink(zipPath).catch(() => {});
+    await fsp.unlink(zipResult.path).catch(() => {});
   }
 }
 
@@ -323,23 +355,86 @@ async function createWorkTree(rootDir, files, sendFeedback) {
   return { rootDir: root, fileCount: files.length, files: files.map((file) => file.path) };
 }
 
+function normalizeSearchResultUrl(rawUrl) {
+  if (!rawUrl) return '';
+  try {
+    const parsed = new URL(rawUrl, 'https://duckduckgo.com');
+    const redirected = parsed.searchParams.get('uddg') || parsed.searchParams.get('u');
+    return redirected ? decodeURIComponent(redirected) : parsed.href;
+  } catch (_error) {
+    return rawUrl;
+  }
+}
+
+function collectSearchResults(html, selectors) {
+  const $ = cheerio.load(html);
+  const results = [];
+  $(selectors.container).each((_, el) => {
+    const title = $(el).find(selectors.title).first().text().replace(/\s+/g, ' ').trim();
+    const rawUrl = $(el).find(selectors.link).first().attr('href');
+    const snippet = $(el).find(selectors.snippet).first().text().replace(/\s+/g, ' ').trim();
+    const url = normalizeSearchResultUrl(rawUrl);
+    if ((title || snippet) && url && !results.some((item) => item.url === url)) {
+      results.push({ title, url, snippet });
+    }
+  });
+  return results;
+}
+
+async function fetchSearchProvider(provider, query) {
+  const headers = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124 Safari/537.36',
+    Accept: 'text/html,application/xhtml+xml'
+  };
+
+  if (provider === 'duckduckgo-html') {
+    const { data } = await axios.get('https://duckduckgo.com/html/', { params: { q: query }, timeout: 60000, headers });
+    return collectSearchResults(data, {
+      container: '.result',
+      title: '.result__title',
+      link: '.result__a',
+      snippet: '.result__snippet'
+    });
+  }
+
+  if (provider === 'duckduckgo-lite') {
+    const { data } = await axios.get('https://lite.duckduckgo.com/lite/', { params: { q: query }, timeout: 60000, headers });
+    return collectSearchResults(data, {
+      container: 'tr',
+      title: 'a.result-link, a[href]',
+      link: 'a.result-link, a[href]',
+      snippet: '.result-snippet, td:last-child'
+    });
+  }
+
+  const { data } = await axios.get('https://www.bing.com/search', { params: { q: query }, timeout: 60000, headers });
+  return collectSearchResults(data, {
+    container: 'li.b_algo',
+    title: 'h2',
+    link: 'h2 a',
+    snippet: '.b_caption p, p'
+  });
+}
+
 async function webSearch(query, sendFeedback) {
   if (sendFeedback) await sendFeedback(`Searching web for: ${query}`);
-  const { data } = await axios.get('https://duckduckgo.com/html/', {
-    params: { q: query },
-    timeout: 60000,
-    headers: { 'User-Agent': 'Mozilla/5.0 TelegramBot/1.0' }
-  });
-  const $ = cheerio.load(data);
-  const results = [];
-  $('.result').slice(0, 8).each((_, el) => {
-    const title = $(el).find('.result__title').text().replace(/\s+/g, ' ').trim();
-    const url = $(el).find('.result__a').attr('href');
-    const snippet = $(el).find('.result__snippet').text().replace(/\s+/g, ' ').trim();
-    if (title || url || snippet) results.push({ title, url, snippet });
-  });
-  if (sendFeedback) await sendFeedback(`Search complete. Results: ${results.length}`);
-  return results;
+  const providers = ['duckduckgo-html', 'duckduckgo-lite', 'bing'];
+  const errors = [];
+
+  for (const provider of providers) {
+    try {
+      const results = (await fetchSearchProvider(provider, query)).slice(0, 8);
+      if (results.length) {
+        if (sendFeedback) await sendFeedback(`Search complete using ${provider}. Results: ${results.length}`);
+        return results;
+      }
+      errors.push(`${provider}: no results parsed`);
+    } catch (error) {
+      errors.push(`${provider}: ${error.message}`);
+    }
+  }
+
+  throw new Error(`Search failed. ${errors.join(' | ')}`);
 }
 
 async function fetchUrl(url, sendFeedback) {
@@ -367,13 +462,39 @@ function findBrowserExecutable() {
   return candidates.find((candidate) => fs.existsSync(candidate));
 }
 
+function getPlaywrightExecutablePath() {
+  try {
+    return chromium.executablePath();
+  } catch (_error) {
+    return '';
+  }
+}
+
+async function ensurePlaywrightChromium(sendFeedback) {
+  const executablePath = getPlaywrightExecutablePath();
+  if (executablePath && fs.existsSync(executablePath)) return executablePath;
+
+  if (sendFeedback) await sendFeedback('Playwright Chromium is missing. Installing browser runtime with: npx playwright install chromium');
+  try {
+    await runCommand('npx playwright install chromium', sendFeedback, getInstallSafeEnv('npx playwright install chromium'));
+  } catch (error) {
+    if (sendFeedback) await sendFeedback(`Playwright browser install failed (${error.message.slice(0, 180)}). I will try any system Chrome/Chromium fallback.`);
+  }
+
+  const installedPath = getPlaywrightExecutablePath();
+  return installedPath && fs.existsSync(installedPath) ? installedPath : '';
+}
+
 async function launchBrowser(sendFeedback) {
   const executablePath = findBrowserExecutable();
   const options = { headless: true };
   if (executablePath) {
     options.executablePath = executablePath;
     if (sendFeedback) await sendFeedback(`Using browser: ${executablePath}`);
+    return chromium.launch(options);
   }
+
+  await ensurePlaywrightChromium(sendFeedback);
   return chromium.launch(options);
 }
 
@@ -523,12 +644,26 @@ async function findAPIs(url, sendFeedback) {
   return result;
 }
 
+
+async function unzipFileTool(zipPath, destination, sendFeedback) {
+  const resolvedZip = path.resolve(zipPath);
+  const stats = await fsp.stat(resolvedZip);
+  if (!stats.isFile()) throw new Error(`Not a file: ${zipPath}`);
+  const resolvedDestination = path.resolve(destination || path.join(path.dirname(resolvedZip), path.basename(resolvedZip, path.extname(resolvedZip))));
+  if (sendFeedback) await sendFeedback(`Extracting ${resolvedZip} to ${resolvedDestination} without pushing to GitHub...`);
+  const result = await extractZipFile(resolvedZip, resolvedDestination);
+  if (sendFeedback) await sendFeedback(`Extracted zip. Destination: ${resolvedDestination}`);
+  return { destination: resolvedDestination, strippedRoot: result.strippedRoot || null, pushedToGitHub: false };
+}
+
 module.exports = {
   tools,
   execTool,
   zipAndUpload,
+  createZipArchive,
   sendFile,
   createWorkTree,
+  unzipFileTool,
   webSearch,
   fetchUrl,
   scrapeSite,
