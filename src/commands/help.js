@@ -18,9 +18,10 @@ function buildHelpText(prefix = '/') {
     `${prefix}unban <userId> - unban user`,
     `${prefix}resetuser <userId> - reset limits and unban`,
     '',
-    'Zip workflow:',
-    '- Send a .zip file and the bot saves it to your workspace, lists saved zips, then asks for repo URL and token.',
-    '- You can also reply to a .zip with /gitpush and the bot saves that replied zip before pushing.',
+    'Zip / create workflow:',
+    '- Send a .zip file and the bot saves and extracts it only. It will not ask for GitHub details from a plain upload.',
+    '- When you ask the AI to create a project, it creates a full worktree, asks if you want updates, then zips/uploads to Gofile or sends the zip in chat.',
+    '- Use /gitpush only when you want the extracted workspace pushed to GitHub; then the bot asks for repo URL and token.',
     '',
     'Limits:',
     '- Admin has unlimited usage. Other users can use AI/run and push up to the configured daily limit.'
