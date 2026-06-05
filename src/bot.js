@@ -17,6 +17,7 @@ const { buildHelpText } = require('./commands/help');
 const accessControl = require('./utils/accessControl');
 const { appendLog, tailLogs } = require('./utils/logs');
 const { requestWithRetry } = require('./utils/httpRetry');
+const { callOmegaProvider, getOmegaProviders } = require('./utils/omegaFallback');
 const consoleCapture = require('./utils/consoleCapture');
 const { isZipFileName, listWorkspaceZips, saveTelegramZip, unzipFile } = require('./utils/fileHandler');
 
@@ -27,19 +28,22 @@ const GROQ_MODEL = process.env.GROQ_MODEL || 'llama-3.3-70b-versatile';
 const ALLOWED_USER_ID = process.env.ALLOWED_USER_ID ? Number.parseInt(process.env.ALLOWED_USER_ID, 10) : null;
 const OWNER_ONLY = process.env.OWNER_ONLY === '1';
 const creationSessions = new Map();
+const TELEGRAM_DOCUMENT_LIMIT_BYTES = Number(process.env.TELEGRAM_DOCUMENT_LIMIT_BYTES || 50 * 1024 * 1024);
 
 const SYSTEM_PROMPT = `You are an autonomous CLI agent controlling a server. You can:
 - Run terminal commands with exec, including installing missing tools/modules when needed
 - Create full project worktrees with createWorkTree
-- Zip folders and upload to gofile.io with zipAndUpload
+- Zip completed files/folders and send them directly in Telegram; if Telegram upload fails or the zip is too large, upload to gofile.io with zipAndUpload
 - Send existing files directly to chat with sendFile
-- Browse web, scrape sites, find APIs
+- Browse web, scrape sites, find and validate API endpoints before sending endpoint scripts
+- Generate images with generateImage when the user asks for AI art, text-to-image, pictures, or visual concepts
+- Analyze uploaded photos with GPT-4 Mini's image-capable Omega fallback while using the same memory
 - Take full-page website screenshots with screenshot and send the image to chat
 - Send a screenshot of this bot's own console/output transcript with consoleScreenshot
 - Extract zip files with unzipFile without asking for GitHub details
 When the user asks you to create, build, scaffold, generate, or code a project/app/site/bot, first draft a clean work tree with sensible folders, then write complete code/config files for every needed directory using createWorkTree. Do not leave empty placeholder directories. After creating it, the bot will ask whether the user wants updates before packaging.
 Only push to GitHub when the user explicitly runs /gitpush or clearly asks to push/upload to GitHub. If the user only asks to unzip, extract, inspect, edit, build, or send files, do not ask for a GitHub repo URL/token and do not run git push.
-Always create missing output directories before redirecting command output into files. Always give feedback before/after actions. If user asks you to scrape, generate code, install dependencies, or build a project, you must run the code/command and report the console output. If a command fails, diagnose it, install missing dependencies/tools if safe, retry with another approach, and only stop after every reasonable method fails. If output is a single short script, you may paste it in chat; if the user asks to send/download a file in chat, call sendFile with the file path; if there are many files, create them as a worktree and let the bot package them after user approval. Remember and use the saved chat history, user profile, and memories provided in the prompt.`;
+Always create missing output directories before redirecting command output into files. Always give feedback before/after actions. If user asks you to scrape, generate code, install dependencies, or build a project, you must run the code/command and report the console output. If a command fails, diagnose it, install missing dependencies/tools if safe, retry with another approach, and only stop after every reasonable method fails. If the user asks you to scrape a site for endpoints/APIs, use deepScrape or scrapeSite, then findAPIs, and only present endpoint scripts after the endpoint has been validated with a live request. If a scrape succeeds, include a screenshot when available. If output is a single short script, you may paste it in chat; if the user asks to send/download a file in chat, call sendFile with the file path; if there are many files, create them as a worktree and let the bot package them after user approval. Remember and use the saved chat history, user profile, and memories provided in the prompt.`;
 
 if (!process.env.BOT_TOKEN) {
   throw new Error('Missing BOT_TOKEN in environment.');
@@ -68,19 +72,33 @@ bot.command('gitpush', async (ctx) => ctx.scene.enter('gitPush'));
 bot.command('model', async (ctx) => {
   const selected = await accessControl.getModel(ctx.from.id, DEFAULT_BRAIN);
   return ctx.reply(`Current AI model: ${selected}
-Choose a model or use /gemini or /groq.`, {
+Choose a model. All choices share the bot's saved memory/session context.`, {
     reply_markup: {
-      inline_keyboard: [[
-        { text: '✨ Gemini', callback_data: 'model:gemini' },
-        { text: '⚡ Groq', callback_data: 'model:groq' }
-      ]]
+      inline_keyboard: [
+        [
+          { text: '⚡ Groq', callback_data: 'model:groq' },
+          { text: '✨ Gemini', callback_data: 'model:gemini' }
+        ],
+        [
+          { text: '🧠 Qwen', callback_data: 'model:qwen' },
+          { text: '🌿 Claude Haiku', callback_data: 'model:claude-haiku' }
+        ],
+        [
+          { text: '🤖 GPT-4 Mini', callback_data: 'model:gpt-4-mini' },
+          { text: '🔎 DeepSeek', callback_data: 'model:deepseek' }
+        ]
+      ]
     }
   });
 });
 
 bot.command('gemini', async (ctx) => switchModel(ctx, 'gemini'));
 bot.command('groq', async (ctx) => switchModel(ctx, 'groq'));
-bot.action(/^model:(gemini|groq)$/, async (ctx) => {
+bot.command('qwen', async (ctx) => switchModel(ctx, 'qwen'));
+bot.command('claudehaiku', async (ctx) => switchModel(ctx, 'claude-haiku'));
+bot.command('gpt4mini', async (ctx) => switchModel(ctx, 'gpt-4-mini'));
+bot.command('deepseek', async (ctx) => switchModel(ctx, 'deepseek'));
+bot.action(/^model:(gemini|groq|qwen|claude-haiku|gpt-4-mini|deepseek)$/, async (ctx) => {
   await ctx.answerCbQuery().catch(() => {});
   return switchModel(ctx, ctx.match[1]);
 });
@@ -159,9 +177,33 @@ bot.command('getfile', async (ctx) => {
   const filePath = path.resolve(workspace.getPath(ctx.from.id), rel);
   if (!filePath.startsWith(workspace.getPath(ctx.from.id))) return ctx.reply('Invalid path.');
   if (!(await fs.pathExists(filePath))) return ctx.reply('File not found.');
-  return ctx.replyWithDocument({ source: filePath });
+  return sendDocumentOrGofile(ctx, filePath, `📄 ${path.basename(filePath)}`);
 });
 
+
+bot.on('photo', async (ctx) => {
+  const access = await consumeUsageOrReply(ctx, 'image-chat');
+  if (!access) return;
+
+  const userId = ctx.from.id;
+  const photos = ctx.message?.photo || [];
+  const bestPhoto = photos[photos.length - 1];
+  if (!bestPhoto) return ctx.reply('No image found.');
+
+  try {
+    const imageUrl = await ctx.telegram.getFileLink(bestPhoto.file_id);
+    const prompt = ctx.message?.caption || 'Describe this image and answer any question about it.';
+    const provider = getOmegaProviders().find((item) => item.key === 'omega-gpt-4-mini');
+    await ctx.reply('🖼️ Analyzing image with GPT-4 Mini fallback memory...');
+    const result = await callOmegaProvider(provider, userId, prompt, { imageUrl: imageUrl.href || imageUrl.toString() });
+    historyManager.addMessage(userId, 'user', `[image] ${prompt}`);
+    historyManager.addMessage(userId, 'assistant', result.answer);
+    return ctx.reply(`✅ ${result.answer.slice(0, 3500)}`);
+  } catch (error) {
+    await appendLog(userId, 'image_chat_error', error.message);
+    return ctx.reply(`❌ Image analysis failed: ${error.message}`);
+  }
+});
 
 bot.on('document', async (ctx) => {
   const document = ctx.message?.document;
@@ -291,14 +333,16 @@ async function executeToolCall(name, args, sendFeedback, userId) {
     case 'webSearch': return agentTools.webSearch(args.query, sendFeedback);
     case 'fetchUrl': return agentTools.fetchUrl(args.url, sendFeedback);
     case 'scrapeSite': return agentTools.scrapeSite(args.url, args.maxDepth, sendFeedback);
+    case 'deepScrape': return agentTools.deepScrape(args.url, args, sendFeedback);
     case 'screenshot': return agentTools.screenshot(args.url, args.path, args.fullPage, sendFeedback);
     case 'findAPIs': return agentTools.findAPIs(args.url, sendFeedback);
+    case 'generateImage': return agentTools.generateImage(args, sendFeedback);
     default: throw new Error(`Unknown tool: ${name}`);
   }
 }
 
 function shouldDeliverToolResult(toolName, result) {
-  return ['screenshot', 'consoleScreenshot', 'scrapeSite', 'zipAndUpload', 'sendFile', 'unzipFile', 'createWorkTree'].includes(toolName) || Boolean(result?.path || result?.savedPath || result?.type === 'url');
+  return ['screenshot', 'consoleScreenshot', 'scrapeSite', 'deepScrape', 'zipAndUpload', 'sendFile', 'unzipFile', 'createWorkTree', 'generateImage'].includes(toolName) || Boolean(result?.path || result?.savedPath || result?.type === 'url');
 }
 
 function buildMessages(userMsg, history, userId) {
@@ -334,23 +378,70 @@ function parseToolJson(raw) {
 async function deliverAgentResult(ctx, result) {
   if (result && typeof result === 'object') {
     if (result.type === 'url') return ctx.reply(`✅ Done. Download: ${result.url}`);
+    if (result.type === 'images' && Array.isArray(result.images)) {
+      await ctx.reply(`✅ Generated ${result.images.length} image(s) for: ${result.prompt || 'your prompt'}`);
+      for (const image of result.images.slice(0, 10)) {
+        const imageUrl = image.url || image;
+        try {
+          await ctx.replyWithPhoto(imageUrl, { caption: `🖼️ ${result.prompt || 'Generated image'}${image.seed ? `\nSeed: ${image.seed}` : ''}` });
+        } catch (_error) {
+          await ctx.reply(`🖼️ ${imageUrl}`);
+        }
+      }
+      return;
+    }
+
+    if (result.savedPath && await fs.pathExists(result.savedPath)) {
+      await ctx.reply(`✅ Done. Scrape saved: ${result.savedPath}\n\nConsole output:\n\`\`\`\n${String(result.consoleOutput || '').slice(0, 2500)}\n\`\`\``);
+      if (result.screenshotPath && await fs.pathExists(result.screenshotPath)) {
+        await ctx.replyWithPhoto({ source: result.screenshotPath }, { caption: result.screenshotCaption || '🖼️ Scrape screenshot' });
+      }
+      return sendDocumentOrGofile(ctx, result.savedPath, '📄 Scrape JSON');
+    }
+
     if (result.path && await fs.pathExists(result.path)) {
       const isImage = (/^image\//i.test(result.mimetype || '') || /\.(png|jpe?g|webp)$/i.test(result.path)) && !/svg\+xml/i.test(result.mimetype || '') && !/\.svg$/i.test(result.path);
       await ctx.reply(`✅ Done. File created: ${result.path}`);
       if (isImage) {
         return ctx.replyWithPhoto({ source: result.path }, { caption: result.caption || '🖼️ Screenshot' });
       }
-      return ctx.replyWithDocument({ source: result.path });
-    }
-    if (result.savedPath && await fs.pathExists(result.savedPath)) {
-      await ctx.reply(`✅ Done. Scrape saved: ${result.savedPath}\n\nConsole output:\n\`\`\`\n${String(result.consoleOutput || '').slice(0, 2500)}\n\`\`\``);
-      return ctx.replyWithDocument({ source: result.savedPath });
+      return sendDocumentOrGofile(ctx, result.path, result.caption || `📄 ${path.basename(result.path)}`);
     }
     return ctx.reply(`✅ ${JSON.stringify(result, null, 2).slice(0, 3500)}`);
   }
   return ctx.reply(`✅ ${String(result || 'Done').slice(0, 3500)}`);
 }
 
+async function sendDocumentOrGofile(ctx, filePath, caption = '') {
+  const stat = await fs.stat(filePath);
+  const filename = path.basename(filePath);
+
+  if (stat.size > TELEGRAM_DOCUMENT_LIMIT_BYTES) {
+    await ctx.reply(`⚠️ ${filename} is ${formatBytes(stat.size)}, which is over Telegram's bot upload limit. Uploading to Gofile instead...`);
+    const upload = await agentTools.uploadFileToGofile(filePath, async (msg) => consoleCapture.append(ctx.from.id, msg));
+    return ctx.reply(`✅ Download: ${upload.url}`);
+  }
+
+  try {
+    return await ctx.replyWithDocument({ source: filePath, filename }, caption ? { caption } : undefined);
+  } catch (error) {
+    await ctx.reply(`⚠️ Telegram could not send ${filename} (${error.message.slice(0, 500)}). Uploading to Gofile instead...`);
+    const upload = await agentTools.uploadFileToGofile(filePath, async (msg) => consoleCapture.append(ctx.from.id, msg));
+    return ctx.reply(`✅ Download: ${upload.url}`);
+  }
+}
+
+function formatBytes(bytes) {
+  if (bytes < 1024) return `${bytes} B`;
+  const units = ['KB', 'MB', 'GB'];
+  let value = bytes / 1024;
+  let unit = units.shift();
+  while (value >= 1024 && units.length) {
+    value /= 1024;
+    unit = units.shift();
+  }
+  return `${value.toFixed(value >= 10 ? 1 : 2)} ${unit}`;
+}
 
 
 function isYes(text) {
@@ -361,9 +452,8 @@ function isNoOrPackage(text) {
   return /^(no|nah|nope|done|finish|finished|zip|package|upload|send|ship|n)\b/i.test(String(text || '').trim());
 }
 
-function wantsChatZip(text) {
-  const value = String(text || '').toLowerCase();
-  return /send.*(zip|file|chat)|chat.*(zip|file)|direct.*(zip|file)|telegram/.test(value) && !/gofile|link|upload/.test(value);
+function wantsGofile(text) {
+  return /gofile|download link|upload|host/i.test(String(text || ''));
 }
 
 async function promptForCreationUpdates(ctx) {
@@ -371,7 +461,7 @@ async function promptForCreationUpdates(ctx) {
   if (!pending || pending.stage !== 'await_update') return;
 
   const files = (pending.files || []).slice(0, 40).join('\n');
-  await ctx.reply(`✅ Project worktree is ready at:\n${pending.rootDir}\n\nFiles created (${pending.fileCount || pending.files?.length || 0}):\n\n\`\`\`\n${files.slice(0, 2200)}\n\`\`\`\n\nDo you want any updates before I package it? Reply **yes** to add/change something, or **no** to zip it and upload to Gofile. You can also say "send zip to chat".`);
+  await ctx.reply(`✅ Project worktree is ready at:\n${pending.rootDir}\n\nFiles created (${pending.fileCount || pending.files?.length || 0}):\n\n\`\`\`\n${files.slice(0, 2200)}\n\`\`\`\n\nDo you want any updates before I package it? Reply **yes** to add/change something, or **no** to zip it and send it here in chat. You can also say "upload to Gofile" if you want a download link instead.`);
 }
 
 async function finalizeCreation(ctx, pending, options = {}) {
@@ -383,29 +473,20 @@ async function finalizeCreation(ctx, pending, options = {}) {
 
   creationSessions.delete(userId);
 
-  if (options.directZip) {
-    const zipResult = await agentTools.createZipArchive(pending.rootDir, null, sendFeedback);
-    try {
-      await ctx.reply(`✅ Zip ready. Sending it here in chat instead of uploading to Gofile.`);
-      return ctx.replyWithDocument({ source: zipResult.path }, { caption: zipResult.caption || '📦 Project zip' });
-    } finally {
-      await fs.unlink(zipResult.path).catch(() => {});
-    }
-  }
-
+  const zipResult = await agentTools.createZipArchive(pending.rootDir, null, sendFeedback);
   try {
-    const upload = await agentTools.zipAndUpload(pending.rootDir, sendFeedback);
-    return ctx.reply(`✅ Project zipped and uploaded to Gofile:\n${upload.url}`);
-  } catch (error) {
-    await ctx.reply(`⚠️ Gofile upload failed (${error.message.slice(0, 500)}). I will send the zip directly in chat instead.`);
-    const zipResult = await agentTools.createZipArchive(pending.rootDir, null, sendFeedback);
-    try {
-      return ctx.replyWithDocument({ source: zipResult.path }, { caption: zipResult.caption || '📦 Project zip' });
-    } finally {
-      await fs.unlink(zipResult.path).catch(() => {});
+    if (options.gofile) {
+      const upload = await agentTools.uploadFileToGofile(zipResult.path, sendFeedback);
+      return ctx.reply(`✅ Project zipped and uploaded to Gofile:\n${upload.url}`);
     }
+
+    await ctx.reply('✅ Zip ready. Sending it here in chat. If Telegram rejects it, I will upload it to Gofile instead.');
+    return sendDocumentOrGofile(ctx, zipResult.path, zipResult.caption || '📦 Project zip');
+  } finally {
+    await fs.unlink(zipResult.path).catch(() => {});
   }
 }
+
 
 async function handleCreationFollowup(ctx, userText) {
   const userId = ctx.from.id;
@@ -420,10 +501,10 @@ async function handleCreationFollowup(ctx, userText) {
     }
 
     if (isNoOrPackage(userText)) {
-      return finalizeCreation(ctx, pending, { directZip: wantsChatZip(userText) });
+      return finalizeCreation(ctx, pending, { gofile: wantsGofile(userText) });
     }
 
-    return ctx.reply('Please reply **yes** if you want updates, or **no** to zip and upload it. You can also say "send zip to chat".');
+    return ctx.reply('Please reply **yes** if you want updates, or **no** to zip and send it here. You can also say "upload to Gofile".');
   }
 
   if (pending.stage === 'await_details') {
@@ -462,7 +543,7 @@ async function handleCreationFollowup(ctx, userText) {
 }
 
 async function switchModel(ctx, model) {
-  if (!['gemini', 'groq'].includes(model)) return ctx.reply('Unknown model. Use /gemini or /groq.');
+  if (!['gemini', 'groq', 'qwen', 'claude-haiku', 'gpt-4-mini', 'deepseek'].includes(model)) return ctx.reply('Unknown model. Use /gemini, /groq, qwen, claude-haiku, gpt-4-mini, or deepseek.');
   await accessControl.setModel(ctx.from.id, model);
   await appendLog(ctx.from.id, 'model_switch', model);
   return ctx.reply(`✅ Switched AI model to ${model}.`);
@@ -584,6 +665,8 @@ async function runAgent(userMsg, history = [], sendFeedback, userId, depth = 0) 
     }
   }
 
+  const directOmegaProvider = getOmegaProviders().find((provider) => provider.key === `omega-${selectedBrain}` || provider.key.endsWith(selectedBrain));
+  if (directOmegaProvider) return runOmegaProviderAgent(directOmegaProvider, userMsg, history, sendFeedback, userId, depth);
   if (selectedBrain === 'gemini') return runGeminiFallbackAgent(userMsg, history, sendFeedback, userId, depth);
   return runClaudeFallbackAgent(userMsg, history, sendFeedback, userId, depth);
 }
@@ -593,7 +676,7 @@ async function runClaudeFallbackAgent(userMsg, history = [], sendFeedback, userI
   const toolNames = agentTools.tools.map((t) => t.name).join(', ');
   const prompt = `${SYSTEM_PROMPT}\n\n${historyManager.formatMemoryContext(userId)}
 
-You are Claude Pro fallback mode in a three-model chain (Groq -> Claude Pro -> Gemini). Available tools: ${toolNames}.
+You are Claude Pro fallback mode in a shared-memory fallback chain (Groq -> Claude Pro -> Gemini -> Omega Qwen/Claude Haiku/Gemini Premium/GPT-4 Mini/DeepSeek). Available tools: ${toolNames}.
 Return ONLY JSON. To call a tool return {"tool":"toolName","args":{...}}. To answer return {"final":"message"}.
 If a scrape/build/install task produced code or data, make sure a tool has run it and include console output in your final.
 User/task: ${userMsg}`;
@@ -603,7 +686,7 @@ User/task: ${userMsg}`;
     raw = await callClaudePro(userId, prompt);
     if (/^Claude Pro Error:/i.test(raw)) throw new Error(raw);
   } catch (error) {
-    if (sendFeedback) await sendFeedback(`Claude Pro unavailable; falling back to Gemini...`);
+    if (sendFeedback) await sendFeedback(`Claude Pro unavailable; falling back to Gemini, then Omega model APIs if needed...`);
     return runGeminiFallbackAgent(userMsg, history, sendFeedback, userId, depth);
   }
 
@@ -624,12 +707,19 @@ async function runGeminiFallbackAgent(userMsg, history = [], sendFeedback, userI
   if (depth > 8) throw new Error('Tool recursion limit reached');
   const toolNames = agentTools.tools.map((t) => t.name).join(', ');
   const messages = buildMessages(
-    `You are Gemini fallback mode in a three-model chain (Groq -> Claude Pro -> Gemini). Available tools: ${toolNames}. Return ONLY JSON. To call a tool return {"tool":"toolName","args":{...}}. To answer return {"final":"message"}. If a scrape/build/install task produced code or data, make sure a tool has run it and include console output in your final. User/task: ${userMsg}`,
+    `You are Gemini fallback mode in a shared-memory fallback chain (Groq -> Claude Pro -> Gemini -> Omega Qwen/Claude Haiku/Gemini Premium/GPT-4 Mini/DeepSeek). Available tools: ${toolNames}. Return ONLY JSON. To call a tool return {"tool":"toolName","args":{...}}. To answer return {"final":"message"}. If a scrape/build/install task produced code or data, make sure a tool has run it and include console output in your final. User/task: ${userMsg}`,
     history,
     userId
   );
 
-  const raw = await askGemini(messages);
+  let raw;
+  try {
+    raw = await askGemini(messages);
+  } catch (error) {
+    if (sendFeedback) await sendFeedback(`Gemini unavailable; falling back to Omega model APIs...`);
+    return runOmegaFallbackAgent(userMsg, history, sendFeedback, userId, depth, error);
+  }
+
   const parsed = parseToolJson(raw);
   if (!parsed) return raw;
 
@@ -642,6 +732,41 @@ async function runGeminiFallbackAgent(userMsg, history = [], sendFeedback, userI
 
   return parsed.final || raw;
 }
+
+async function runOmegaFallbackAgent(userMsg, history = [], sendFeedback, userId, depth = 0, previousError = null) {
+  const providers = getOmegaProviders();
+  let lastError = previousError;
+  for (const provider of providers) {
+    try {
+      if (sendFeedback) await sendFeedback(`Trying ${provider.label} fallback with shared session memory...`);
+      return await runOmegaProviderAgent(provider, userMsg, history, sendFeedback, userId, depth);
+    } catch (error) {
+      lastError = error;
+      if (sendFeedback) await sendFeedback(`${provider.label} fallback failed: ${error.message.slice(0, 220)}`);
+    }
+  }
+  throw new Error(`All AI fallbacks failed: ${lastError?.message || 'unknown error'}`);
+}
+
+async function runOmegaProviderAgent(provider, userMsg, history = [], sendFeedback, userId, depth = 0) {
+  if (depth > 8) throw new Error('Tool recursion limit reached');
+  const toolNames = agentTools.tools.map((t) => t.name).join(', ');
+  const prompt = `${SYSTEM_PROMPT}\n\n${historyManager.formatMemoryContext(userId)}\n\nYou are ${provider.label} fallback mode in the shared-memory AI chain. Available tools: ${toolNames}.\nReturn ONLY JSON. To call a tool return {"tool":"toolName","args":{...}}. To answer return {"final":"message"}. If a scrape/build/install task produced code or data, make sure a tool has run it and include console output in your final.\nUser/task: ${userMsg}`;
+  const response = await callOmegaProvider(provider, userId, prompt);
+  const raw = response.answer;
+  const parsed = parseToolJson(raw);
+  if (!parsed) return raw;
+
+  if (parsed.memory) historyManager.addMemory(userId, parsed.memory, provider.key);
+  if (parsed.tool) {
+    const result = await executeToolCall(parsed.tool, parsed.args || {}, sendFeedback, userId);
+    if (shouldDeliverToolResult(parsed.tool, result)) return result;
+    return runOmegaProviderAgent(provider, `Tool result: ${JSON.stringify(result)}`, [...history, { role: 'user', content: userMsg }], sendFeedback, userId, depth + 1);
+  }
+
+  return parsed.final || raw;
+}
+
 
 async function runTerminalCommand(ctx, command, cwd) {
   await appendLog(ctx.from.id, 'terminal_run', command);
@@ -675,9 +800,12 @@ async function handleLlamaCoder(ctx, prompt, cwd) {
     const rootDir = path.join(cwd, `app-${Date.now()}`);
     const sendFeedback = async (msg) => ctx.reply(`⏳ ${msg}`);
     await agentTools.createWorkTree(rootDir, data.files, sendFeedback);
-    const upload = await agentTools.zipAndUpload(rootDir, sendFeedback);
-
-    return ctx.reply(`✅ App saved and uploaded: ${upload.url}`);
+    const zipResult = await agentTools.createZipArchive(rootDir, null, sendFeedback);
+    try {
+      return await sendDocumentOrGofile(ctx, zipResult.path, zipResult.caption || '📦 App zip');
+    } finally {
+      await fs.unlink(zipResult.path).catch(() => {});
+    }
   } catch (error) {
     return ctx.reply(`Build failed: ${error.message}`);
   }

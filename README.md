@@ -35,9 +35,9 @@ node index.js
 - `/play <song name>` - search and play a song using the configured play API.
 - `/workspace` - list files in your workspace.
 - `/getfile <relative-path>` - download a workspace file.
-- `/model` - show Gemini/Groq switch buttons.
-- `/gemini` and `/groq` - prefix commands for switching the AI provider.
-- Plain chat messages use the autonomous AI agent. It remembers per-user chat history, can scrape pages, take screenshots, install missing tools/modules with browser-download guards, run generated code, report console output, and upload multi-file results to gofile.io.
+- `/model` - show Groq, Gemini, Qwen, Claude Haiku, GPT-4 Mini, and DeepSeek switch buttons.
+- `/gemini`, `/groq`, `/qwen`, `/claudehaiku`, `/gpt4mini`, and `/deepseek` - prefix commands for switching the AI provider.
+- Plain chat messages use the autonomous AI agent. It remembers per-user chat history, can scrape pages, run `deepScrape` for JavaScript-heavy pages with Playwright retries/stealth context/network API capture/screenshot output/fallback HTTP fetching, validate likely API endpoints before presenting endpoint scripts, take screenshots, install missing tools/modules with browser-download guards, run generated code, report console output, and send completed project zips directly in Telegram with Gofile fallback, generate images with the Raphael text-to-image API, and analyze uploaded photos with GPT-4 Mini image fallback.
 - Upload a `.zip` document to save it into your workspace, immediately list saved zip files, and automatically start the GitHub URL/token push flow.
 
 
@@ -61,4 +61,6 @@ SCREENSHOTONE_ACCESS_KEY=your_screenshotone_access_key
 DAILY_LIMIT=10
 # Optional: set BRAIN=gemini to start with Gemini instead of Groq. Default is groq.
 BRAIN=groq
+# Optional: shared fallback API base for Qwen/Claude Haiku/Gemini Premium/GPT-4 Mini/DeepSeek/Raphael
+OMEGA_AI_BASE_URL=https://omegatech-api.dixonomega.tech/api/ai
 ```
