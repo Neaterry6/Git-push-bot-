@@ -12,7 +12,22 @@ const { unzipFile: extractZipFile } = require('./utils/fileHandler');
 const GOFILE_UPLOAD_API = 'https://upload.gofile.io/uploadfile';
 const GOFILE_TOKEN = process.env.GOFILE_TOKEN || process.env.GOFILE_ACCOUNT_TOKEN || '';
 const SCREENSHOTONE_ACCESS_KEY = process.env.SCREENSHOTONE_ACCESS_KEY || '';
+const OMEGA_AI_BASE_URL = process.env.OMEGA_AI_BASE_URL || 'https://omegatech-api.dixonomega.tech/api/ai';
 const MAX_EXEC_ATTEMPTS = 3;
+const DEFAULT_SCRAPING_SETTINGS = {
+  retries: 3,
+  timeout: 30000,
+  stealthMode: true,
+  proxyRotation: false,
+  headless: true
+};
+
+const DEEP_SCRAPE_USER_AGENTS = [
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+  'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
+  'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
+];
+
 
 const tools = [
   {
@@ -55,6 +70,22 @@ const tools = [
     }
   },
   {
+    name: 'deepScrape',
+    description: 'Render a page with Playwright using realistic browser context, optional stealth hardening, retries, scrolling, and save full rendered HTML/text/link data as JSON. Use for JavaScript-heavy pages. Args: {url: string, retries?: number, timeout?: number, stealthMode?: boolean, headless?: boolean, proxyRotation?: boolean}',
+    parameters: {
+      type: 'object',
+      properties: {
+        url: { type: 'string' },
+        retries: { type: 'number' },
+        timeout: { type: 'number' },
+        stealthMode: { type: 'boolean' },
+        headless: { type: 'boolean' },
+        proxyRotation: { type: 'boolean' }
+      },
+      required: ['url']
+    }
+  },
+  {
     name: 'consoleScreenshot',
     description: 'Send a screenshot image of this bot chat console/output transcript. Use this when the user asks for a screenshot of your own console, terminal, running task, or bot output. Args: {path?: string}',
     parameters: {
@@ -85,8 +116,27 @@ const tools = [
     }
   },
   {
+    name: 'generateImage',
+    description: 'Generate AI images from a text prompt with the Raphael text-to-image API and return image URLs for chat delivery. Args: {prompt: string, aspect?: string, modelId?: string, numberOfImages?: number, highQuality?: boolean, fastMode?: boolean, isSafeContent?: boolean, autoTranslate?: boolean, negativePrompt?: string}',
+    parameters: {
+      type: 'object',
+      properties: {
+        prompt: { type: 'string' },
+        aspect: { type: 'string' },
+        modelId: { type: 'string' },
+        numberOfImages: { type: 'number' },
+        highQuality: { type: 'boolean' },
+        fastMode: { type: 'boolean' },
+        isSafeContent: { type: 'boolean' },
+        autoTranslate: { type: 'boolean' },
+        negativePrompt: { type: 'string' }
+      },
+      required: ['prompt']
+    }
+  },
+  {
     name: 'findAPIs',
-    description: 'Find likely API/documentation endpoints on a website. Args: {url: string}',
+    description: 'Find likely API/documentation endpoints on a website, validate candidates with live HTTP requests, and return status/content-type samples. Args: {url: string}',
     parameters: {
       type: 'object',
       properties: { url: { type: 'string' } },
@@ -199,6 +249,10 @@ function looksLikeMissingRedirectDirectory(output) {
   return /cannot create .*Directory nonexistent|No such file or directory/i.test(output || '');
 }
 
+function shellQuote(value) {
+  return `'${String(value).replace(/'/g, "'\\''")}'`;
+}
+
 async function execTool(command, sendFeedback) {
   const blocked = ['rm -rf /', 'dd ', 'mkfs', ':(){'];
   if (blocked.some((b) => command.includes(b))) throw new Error('Blocked command');
@@ -250,7 +304,7 @@ async function runCommand(command, sendFeedback, env) {
       const now = Date.now();
       if (sendFeedback && now - lastFeedback > 1500) {
         lastFeedback = now;
-        await sendFeedback(`Output:\n${output.slice(-700)}`).catch(() => {});
+        await Promise.resolve(sendFeedback(`Output:\n${output.slice(-700)}`)).catch(() => {});
       }
     });
   }
@@ -485,9 +539,13 @@ async function ensurePlaywrightChromium(sendFeedback) {
   return installedPath && fs.existsSync(installedPath) ? installedPath : '';
 }
 
-async function launchBrowser(sendFeedback) {
+async function launchBrowser(sendFeedback, launchOptions = {}) {
   const executablePath = findBrowserExecutable();
-  const options = { headless: true };
+  const options = {
+    headless: launchOptions.headless !== undefined ? Boolean(launchOptions.headless) : true,
+    args: launchOptions.args || []
+  };
+  if (launchOptions.proxy) options.proxy = launchOptions.proxy;
   if (executablePath) {
     options.executablePath = executablePath;
     if (sendFeedback) await sendFeedback(`Using browser: ${executablePath}`);
@@ -496,6 +554,163 @@ async function launchBrowser(sendFeedback) {
 
   await ensurePlaywrightChromium(sendFeedback);
   return chromium.launch(options);
+}
+
+function buildScrapeSettings(options = {}) {
+  const retries = Number(options.retries ?? DEFAULT_SCRAPING_SETTINGS.retries);
+  const timeout = Number(options.timeout ?? DEFAULT_SCRAPING_SETTINGS.timeout);
+  return {
+    retries: Number.isFinite(retries) && retries > 0 ? Math.min(Math.floor(retries), 5) : DEFAULT_SCRAPING_SETTINGS.retries,
+    timeout: Number.isFinite(timeout) && timeout > 0 ? Math.min(Math.floor(timeout), 120000) : DEFAULT_SCRAPING_SETTINGS.timeout,
+    stealthMode: options.stealthMode !== undefined ? Boolean(options.stealthMode) : DEFAULT_SCRAPING_SETTINGS.stealthMode,
+    headless: options.headless !== undefined ? Boolean(options.headless) : DEFAULT_SCRAPING_SETTINGS.headless,
+    proxyRotation: Boolean(options.proxyRotation ?? DEFAULT_SCRAPING_SETTINGS.proxyRotation)
+  };
+}
+
+function randomFrom(items) {
+  return items[Math.floor(Math.random() * items.length)];
+}
+
+function getProxySettings(settings) {
+  if (!settings.proxyRotation) return undefined;
+  const proxyUrl = process.env.SCRAPE_PROXY_URL || process.env.HTTPS_PROXY || process.env.HTTP_PROXY;
+  return proxyUrl ? { server: proxyUrl } : undefined;
+}
+
+async function applyStealthContext(context) {
+  await context.addInitScript(() => {
+    Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+    Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
+    Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+    Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => 8 });
+    window.chrome = window.chrome || { runtime: {} };
+    const originalQuery = window.navigator.permissions && window.navigator.permissions.query;
+    if (originalQuery) {
+      window.navigator.permissions.query = (parameters) => (
+        parameters && parameters.name === 'notifications'
+          ? Promise.resolve({ state: Notification.permission })
+          : originalQuery(parameters)
+      );
+    }
+  });
+}
+
+async function createScrapeContext(browser, settings) {
+  const context = await browser.newContext({
+    userAgent: randomFrom(DEEP_SCRAPE_USER_AGENTS),
+    viewport: { width: 1920, height: 1080 },
+    locale: 'en-US',
+    timezoneId: 'America/New_York',
+    deviceScaleFactor: 1,
+    javaScriptEnabled: true,
+    ignoreHTTPSErrors: true,
+    extraHTTPHeaders: {
+      Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+      'Accept-Language': 'en-US,en;q=0.9',
+      'Upgrade-Insecure-Requests': '1'
+    }
+  });
+  if (settings.stealthMode) await applyStealthContext(context);
+  return context;
+}
+
+async function simulateHumanActivity(page) {
+  await page.mouse.move(250 + Math.random() * 200, 250 + Math.random() * 200);
+  await page.mouse.wheel(0, 400 + Math.floor(Math.random() * 400));
+  await page.waitForTimeout(800 + Math.floor(Math.random() * 1200));
+}
+
+async function deepScrape(url, options = {}, sendFeedback) {
+  const normalizedUrl = normalizeUrl(url);
+  const settings = buildScrapeSettings(options);
+  const launchArgs = [
+    '--disable-blink-features=AutomationControlled',
+    '--disable-dev-shm-usage',
+    '--no-sandbox'
+  ];
+  const proxy = getProxySettings(settings);
+  let lastError;
+
+  for (let attempt = 1; attempt <= settings.retries; attempt += 1) {
+    if (sendFeedback) await sendFeedback(`Deep scraping ${normalizedUrl} (attempt ${attempt}/${settings.retries})...`);
+    let browser;
+    let context;
+    let page;
+    const consoleLines = [];
+
+    try {
+      browser = await launchBrowser(sendFeedback, { headless: settings.headless, args: launchArgs, proxy });
+      context = await createScrapeContext(browser, settings);
+      page = await context.newPage();
+      const apiResponses = [];
+      page.on('console', (message) => consoleLines.push(`${message.type()}: ${message.text()}`));
+      page.on('response', (responseItem) => {
+        const request = responseItem.request();
+        const responseUrl = responseItem.url();
+        const resourceType = request.resourceType();
+        if (!/^(xhr|fetch)$/i.test(resourceType) && !/api|graphql|\.json(?:$|[?#])/i.test(responseUrl)) return;
+        if (apiResponses.some((item) => item.url === responseUrl && item.method === request.method())) return;
+        apiResponses.push({
+          url: responseUrl,
+          method: request.method(),
+          status: responseItem.status(),
+          contentType: responseItem.headers()['content-type'] || '',
+          resourceType
+        });
+      });
+      const response = await page.goto(normalizedUrl, { waitUntil: 'networkidle', timeout: settings.timeout });
+      await simulateHumanActivity(page);
+      const title = await page.title();
+      const content = await page.content();
+      const text = (await page.locator('body').innerText({ timeout: 10000 }).catch(() => '')).replace(/\s+/g, ' ').trim();
+      const links = await page.$$eval('a[href]', (anchors) => anchors.map((a) => a.href).filter(Boolean).slice(0, 100));
+      const status = response ? response.status() : null;
+      const screenshotPath = path.join(os.tmpdir(), `${new URL(normalizedUrl).hostname.replace(/[^a-z0-9.-]/gi, '_')}-deep-${Date.now()}.png`);
+      await page.screenshot({ path: screenshotPath, fullPage: true }).catch(() => null);
+      const pages = [{
+        url: normalizedUrl,
+        title,
+        status,
+        text: text.slice(0, 12000),
+        links,
+        html: content,
+        apiResponses: apiResponses.slice(0, 100),
+        consoleOutput: consoleLines.slice(-50).join('\n')
+      }];
+      const savedPath = await saveScrapeResult(normalizedUrl, pages, 'deep-playwright');
+      const consoleOutput = await validateScrapeResult(savedPath, sendFeedback);
+      if (sendFeedback) await sendFeedback(`Deep scrape complete. Title: ${title || '(untitled)'}. Saved: ${savedPath}`);
+      return {
+        mode: 'deep-playwright',
+        savedPath,
+        consoleOutput,
+        title,
+        status,
+        contentLength: content.length,
+        screenshotPath: fs.existsSync(screenshotPath) ? screenshotPath : '',
+        screenshotCaption: `🖼️ Deep scrape screenshot for ${normalizedUrl}`,
+        apiResponses: apiResponses.slice(0, 100),
+        text: text.slice(0, 6000),
+        links
+      };
+    } catch (error) {
+      lastError = error;
+      if (sendFeedback) await sendFeedback(`Deep scrape attempt ${attempt} failed: ${error.message.slice(0, 180)}`);
+      if (attempt < settings.retries) await new Promise((resolve) => setTimeout(resolve, 1000 * attempt));
+    } finally {
+      if (page) await page.close().catch(() => {});
+      if (context) await context.close().catch(() => {});
+      if (browser) await browser.close().catch(() => {});
+    }
+  }
+
+  if (sendFeedback) await sendFeedback(`Deep scrape failed (${lastError.message.slice(0, 180)}). Trying HTTP fallback...`);
+  const text = await fetchUrl(normalizedUrl, sendFeedback);
+  const pages = [{ url: normalizedUrl, title: '', status: null, text, links: [], html: '' }];
+  const savedPath = await saveScrapeResult(normalizedUrl, pages, 'http-fallback');
+  const consoleOutput = await validateScrapeResult(savedPath, sendFeedback);
+  return { mode: 'http-fallback', savedPath, consoleOutput, text, links: [] };
 }
 
 async function scrapeSite(url, maxDepth = 1, sendFeedback) {
@@ -519,7 +734,7 @@ async function scrapeSite(url, maxDepth = 1, sendFeedback) {
   }
 
   const savedPath = await saveScrapeResult(url, pages, mode);
-  const consoleOutput = await execTool(`node -e "const fs=require('fs');const data=JSON.parse(fs.readFileSync('${savedPath.replace(/'/g, "'\\''")}','utf8'));console.log('Scrape validation OK. Pages:', data.pages.length); console.log('Mode:', data.mode);"`, sendFeedback);
+  const consoleOutput = await validateScrapeResult(savedPath, sendFeedback);
   if (sendFeedback) await sendFeedback(`Scrape complete. Pages: ${pages.length}. Saved: ${savedPath}`);
   return { mode, savedPath, consoleOutput, pages };
 }
@@ -531,6 +746,11 @@ async function saveScrapeResult(url, pages, mode) {
   const savedPath = path.join(dir, `${hostname}-${Date.now()}.json`);
   await fsp.writeFile(savedPath, JSON.stringify({ url, mode, pages }, null, 2));
   return savedPath;
+}
+
+async function validateScrapeResult(savedPath, sendFeedback) {
+  const script = `const fs=require('fs');const data=JSON.parse(fs.readFileSync(${JSON.stringify(savedPath)},'utf8'));console.log('Scrape validation OK. Pages:', data.pages.length); console.log('Mode:', data.mode);`;
+  return execTool(`node -e ${shellQuote(script)}`, sendFeedback);
 }
 
 async function screenshot(url, outputPath, fullPage = true, sendFeedback) {
@@ -622,26 +842,112 @@ async function scrapePage(browser, url, depth, seen, pages, sendFeedback) {
   }
 }
 
+async function generateImage(options = {}, sendFeedback) {
+  const prompt = String(options.prompt || '').trim();
+  if (!prompt) throw new Error('Image prompt is required');
+  const numberOfImages = Math.min(Math.max(Number(options.numberOfImages || 4), 1), 8);
+  const params = {
+    prompt,
+    aspect: options.aspect || '1:1',
+    model_id: options.modelId || options.model_id || 'raphael-basic',
+    number_of_images: numberOfImages,
+    highQuality: options.highQuality !== undefined ? Boolean(options.highQuality) : true,
+    fastMode: options.fastMode !== undefined ? Boolean(options.fastMode) : true,
+    isSafeContent: options.isSafeContent !== undefined ? Boolean(options.isSafeContent) : false,
+    autoTranslate: options.autoTranslate !== undefined ? Boolean(options.autoTranslate) : true
+  };
+  if (options.negativePrompt) params.negativePrompt = options.negativePrompt;
+
+  if (sendFeedback) await sendFeedback(`Generating ${numberOfImages} image(s): ${prompt}`);
+  const response = await axios.get(`${OMEGA_AI_BASE_URL}/Raphael-text-to-image`, {
+    params,
+    timeout: 180000,
+    validateStatus: () => true
+  });
+
+  const { data, status } = response;
+  if (status >= 400 || data?.statusCode >= 400 || data?.success === false) {
+    throw new Error(`Image generation failed (${status}): ${JSON.stringify(data).slice(0, 500)}`);
+  }
+
+  const images = Array.isArray(data?.images) ? data.images.filter((image) => image?.url) : [];
+  if (!images.length) throw new Error(`Image generation returned no images: ${JSON.stringify(data).slice(0, 500)}`);
+  if (sendFeedback) await sendFeedback(`Generated ${images.length} image(s).`);
+  return {
+    type: 'images',
+    prompt: data.prompt || prompt,
+    model: data.model || params.model_id,
+    aspect: data.aspect || params.aspect,
+    images,
+    raw: data
+  };
+}
+
+async function validateApiEndpoint(candidate, baseUrl) {
+  const target = typeof candidate === 'string' ? candidate : candidate.url;
+  try {
+    const response = await axios.get(target, {
+      timeout: 15000,
+      maxRedirects: 3,
+      headers: {
+        Accept: 'application/json,text/plain,*/*',
+        Referer: baseUrl,
+        'User-Agent': 'Mozilla/5.0 TelegramBot/1.0'
+      },
+      validateStatus: () => true
+    });
+    const data = typeof response.data === 'string' ? response.data : JSON.stringify(response.data);
+    return {
+      url: target,
+      method: 'GET',
+      status: response.status,
+      ok: response.status >= 200 && response.status < 400,
+      contentType: response.headers['content-type'] || '',
+      sample: String(data || '').replace(/\s+/g, ' ').slice(0, 500)
+    };
+  } catch (error) {
+    return {
+      url: target,
+      method: 'GET',
+      status: null,
+      ok: false,
+      contentType: '',
+      error: error.message
+    };
+  }
+}
+
 async function findAPIs(url, sendFeedback) {
-  if (sendFeedback) await sendFeedback(`Finding APIs on ${url}...`);
-  const { data } = await axios.get(url, {
+  const normalizedUrl = normalizeUrl(url);
+  if (sendFeedback) await sendFeedback(`Finding and validating APIs on ${normalizedUrl}...`);
+  const { data } = await axios.get(normalizedUrl, {
     timeout: 60000,
-    headers: { 'User-Agent': 'Mozilla/5.0 TelegramBot/1.0' }
+    headers: { 'User-Agent': 'Mozilla/5.0 TelegramBot/1.0' },
+    validateStatus: () => true
   });
   const $ = cheerio.load(data);
   const candidates = new Set();
-  const base = new URL(url);
-  $('a[href], script[src], link[href]').each((_, el) => {
-    const raw = $(el).attr('href') || $(el).attr('src');
+  const base = new URL(normalizedUrl);
+  $('a[href], script[src], link[href], form[action]').each((_, el) => {
+    const raw = $(el).attr('href') || $(el).attr('src') || $(el).attr('action');
     if (!raw) return;
     const absolute = new URL(raw, base).href;
-    if (/api|swagger|openapi|graphql|developer|docs|reference/i.test(absolute)) candidates.add(absolute);
+    if (/api|swagger|openapi|graphql|developer|docs|reference|\.json(?:$|[?#])/i.test(absolute)) candidates.add(absolute);
   });
-  const common = ['/api', '/api/docs', '/swagger', '/swagger.json', '/openapi.json', '/graphql', '/docs', '/developers'];
+  const inlineMatches = String(data).match(/(?:(?:https?:)?\/\/[^"'\s<>]+|\/[^"'\s<>]+)(?:api|graphql|openapi|swagger|\.json)[^"'\s<>]*/gi) || [];
+  inlineMatches.forEach((entry) => candidates.add(new URL(entry, base).href));
+  const common = ['/api', '/api/docs', '/api/v1', '/api/v2', '/swagger', '/swagger.json', '/openapi.json', '/graphql', '/docs', '/developers'];
   common.forEach((entry) => candidates.add(new URL(entry, base).href));
-  const result = [...candidates].slice(0, 50);
-  if (sendFeedback) await sendFeedback(`Found ${result.length} possible API/docs endpoints.`);
-  return result;
+
+  const candidateList = [...candidates].slice(0, 50);
+  const validated = [];
+  for (const candidate of candidateList.slice(0, 20)) {
+    validated.push(await validateApiEndpoint(candidate, normalizedUrl));
+  }
+
+  const live = validated.filter((item) => item.ok);
+  if (sendFeedback) await sendFeedback(`Found ${candidateList.length} possible API/docs endpoints. Live/valid responses: ${live.length}.`);
+  return { url: normalizedUrl, candidates: candidateList, validated, live };
 }
 
 
@@ -660,6 +966,7 @@ module.exports = {
   tools,
   execTool,
   zipAndUpload,
+  uploadFileToGofile,
   createZipArchive,
   sendFile,
   createWorkTree,
@@ -667,6 +974,8 @@ module.exports = {
   webSearch,
   fetchUrl,
   scrapeSite,
+  deepScrape,
   screenshot,
-  findAPIs
+  findAPIs,
+  generateImage
 };

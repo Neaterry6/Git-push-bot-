@@ -5,7 +5,7 @@
   "main": "bot.js",
   "scripts": {
     "start": "node bot.js",
-    "check": "node --check src/bot.js && node --check src/tools.js && node --check src/utils/history.js && node --check src/utils/ai.js && node --check src/utils/claudePro.js && node --check src/utils/executor.js",
+    "check": "node --check src/bot.js && node --check src/tools.js && node --check src/utils/history.js && node --check src/utils/ai.js && node --check src/utils/claudePro.js && node --check src/utils/executor.js && node --check src/utils/omegaFallback.js",
     "test": "npm run check"
   },
   "dependencies": {
